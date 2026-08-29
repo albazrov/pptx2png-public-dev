@@ -19,7 +19,7 @@ import aiohttp
 import converter_engine
 from user_manager import UserManager
 from utils import extract_text_from_pptx, check_spelling  # НАШ НОВЫЙ ИМПОРТ
-
+from handlers import router
 
 # 1. Определение директории запуска скрипта и имени родительской папки (prod / test)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -166,7 +166,7 @@ dp.workflow_data.update({
 })
 
 # 3. ПОДКЛЮЧАЕМ НАШ ВНЕШНИЙ РОУТЕР (строго после workflow_data.update!)
-dp.include_router(main_router)
+dp.include_router(router)
 
 async def main():
     """Основная функция запуска Telegram-бота."""
