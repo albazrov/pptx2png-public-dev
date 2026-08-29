@@ -4,11 +4,12 @@ import logging
 from pathlib import Path
 from aiogram import Router, F, types, Bot
 from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Импортируем утилиты проверки и базы данных
-from utils import extract_text_from_pptx, check_spelling
+# Импортируем ВСЕ утилиты и конвейер обработки из utils.py
+from utils import extract_text_from_pptx, check_spelling, download_file_by_url, core_pipeline
+
 
 # Инициализируем единый роутер для этого модуля
 router = Router()
