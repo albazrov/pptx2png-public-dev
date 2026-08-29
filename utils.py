@@ -1,6 +1,7 @@
 import aiohttp
 import logging
 import shutil
+import asyncio  # Добавлен для перехвата TimeoutError
 from pathlib import Path
 from typing import Tuple, List, Optional
 from aiogram import Bot, types
@@ -58,12 +59,15 @@ async def check_spelling(text_list: list) -> Tuple[bool, str]:
                         # Не 200 ответ — возвращаем ошибку
                         return False, f"❌ **Ошибка сервиса проверки орфографии:**\nКод ответа: {response.status}\nПопробуйте позже или используйте конвертацию без проверки."
                         
-            except aiohttp.ClientTimeout:
+            except asyncio.TimeoutError:
+                # Перехватываем asyncio.TimeoutError (включает aiohttp серверные таймауты)
                 return False, "❌ **Таймаут при проверке орфографии.**\nСервис не отвечает. Попробуйте позже."
             except aiohttp.ClientError as e:
+                # Перехватываем все клиентские ошибки aiohttp (ConnectionError, ClientResponseError и т.д.)
                 return False, f"❌ **Ошибка сети при проверке орфографии:**\n{str(e)}\nПопробуйте позже."
             except Exception as e:
-                logging.error(f"Неизвестная ошибка Яндекс.Спеллера на слайде {idx}: {e}")
+                # Перехватываем любые другие неожиданные ошибки
+                logging.error(f"Неизвестная ошибка Яндекс.Спеллера на слайде {idx}: {e}", exc_info=True)
                 return False, f"❌ **Неизвестная ошибка при проверке:**\n{str(e)}\nПопробуйте позже."
     
     # Если ни один слайд не был отправлен на проверку
@@ -125,6 +129,12 @@ async def download_file_by_url(url: str, destination: Path, status_message: type
                 with open(destination, "wb") as f:
                     f.write(await response.read())
                 return True
+    except asyncio.TimeoutError:
+        logging.error(f"Таймаут при скачивании по ссылке: {url}")
+        return False
+    except aiohttp.ClientError as e:
+        logging.error(f"Ошибка клиента при скачивании: {e}")
+        return False
     except Exception as e:
         logging.error(f"Исключение при скачивании по URL: {e}")
         return False
