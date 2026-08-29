@@ -2,21 +2,34 @@ import aiohttp
 import logging
 import shutil
 from pathlib import Path
+from typing import Tuple, List, Optional
 from aiogram import Bot, types
 from pptx import Presentation
 
 # Импортируем ваш существующий движок рендеринга
 import converter_engine
 
-async def check_spelling(text_list: list) -> str:
+# ==========================================
+# 1. ПРОВЕРКА ОРФОГРАФИИ (С РАЗДЕЛЕНИЕМ СТАТУСОВ)
+# ==========================================
+
+async def check_spelling(text_list: list) -> Tuple[bool, str]:
     """
     Асинхронно проверяет список текстов слайдов через Яндекс.Спеллер API.
     
     :param text_list: Список строк с текстом каждого слайда
-    :return: Форматированный Markdown-отчет об ошибках или пустая строка, если опечаток нет.
+    :return: Кортеж (успех_проверки, текст_отчёта)
+             - (True, report) - проверка выполнена, отчёт с ошибками или "ошибок нет"
+             - (False, error_message) - проверка не удалась, текст ошибки
     """
+    # Если список пуст или содержит только пустые строки
+    if not text_list or all(not text.strip() for text in text_list):
+        return True, "ℹ️ **В презентации не найден текст для проверки.**"
+    
     url = "https://speller.yandex.net/services/spellservice.json/checkText"
     report_lines = []
+    check_success = False
+    has_errors = False
     
     async with aiohttp.ClientSession() as session:
         for idx, slide_text in enumerate(text_list, start=1):
@@ -29,30 +42,54 @@ async def check_spelling(text_list: list) -> str:
             }
             
             try:
-                async with session.post(url, data=payload, timeout=5) as response:
+                async with session.post(url, data=payload, timeout=10) as response:
                     if response.status == 200:
                         results = await response.json()
+                        check_success = True
                         if results:
+                            has_errors = True
                             report_lines.append(f"📋 **Слайд №{idx}:**")
                             for error in results:
-                                word = error.get("word")
+                                word = error.get("word", "неизвестное слово")
                                 s_list = error.get("s", [])
                                 suggestions = f" ➔ возможно: `{', '.join(s_list)}`" if s_list else " (нет вариантов)"
                                 report_lines.append(f"  • Опечатка в `{word}`{suggestions}")
+                    else:
+                        # Не 200 ответ — возвращаем ошибку
+                        return False, f"❌ **Ошибка сервиса проверки орфографии:**\nКод ответа: {response.status}\nПопробуйте позже или используйте конвертацию без проверки."
+                        
+            except aiohttp.ClientTimeout:
+                return False, "❌ **Таймаут при проверке орфографии.**\nСервис не отвечает. Попробуйте позже."
+            except aiohttp.ClientError as e:
+                return False, f"❌ **Ошибка сети при проверке орфографии:**\n{str(e)}\nПопробуйте позже."
             except Exception as e:
-                logging.error(f"Ошибка Яндекс.Спеллера на слайде {idx}: {e}")
-                
-    if report_lines:
+                logging.error(f"Неизвестная ошибка Яндекс.Спеллера на слайде {idx}: {e}")
+                return False, f"❌ **Неизвестная ошибка при проверке:**\n{str(e)}\nПопробуйте позже."
+    
+    # Если ни один слайд не был отправлен на проверку
+    if not check_success:
+        return False, "❌ **Не удалось проверить текст.**\nСервис не ответил ни на один запрос."
+    
+    # Проверка выполнена успешно
+    if has_errors:
         header = "⚠️ **Внимание! На слайдах обнаружены возможные опечатки:**\n\n"
-        return header + "\n".join(report_lines)
-    return ""
+        return True, header + "\n".join(report_lines)
+    else:
+        return True, "✨ **Орфографических ошибок не найдено!** Текст чистый."
 
-def extract_text_from_pptx(file_path: str) -> list:
+
+# ==========================================
+# 2. ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ PPTX (С ОТДЕЛЬНЫМ СТАТУСОМ)
+# ==========================================
+
+def extract_text_from_pptx(file_path: str) -> Tuple[bool, List[str]]:
     """
     Извлекает весь текст из блоков презентации, группируя его по слайдам.
     
     :param file_path: Путь к локальному файлу .pptx
-    :return: Список строк, где каждый элемент — слитный текст одного слайда
+    :return: Кортеж (успех_извлечения, список_текстов_слайдов)
+             - (True, list) - текст успешно извлечён (может быть пустым)
+             - (False, []) - ошибка при извлечении
     """
     try:
         prs = Presentation(file_path)
@@ -64,11 +101,17 @@ def extract_text_from_pptx(file_path: str) -> list:
                 if hasattr(shape, "text") and shape.text.strip():
                     slide_pieces.append(shape.text)
             presentation_text.append(" ".join(slide_pieces))
-            
-        return presentation_text
+        
+        return True, presentation_text
+        
     except Exception as e:
         logging.error(f"Ошибка извлечения текста из PPTX через python-pptx: {e}")
-        return []
+        return False, []
+
+
+# ==========================================
+# 3. СКАЧИВАНИЕ ПО ССЫЛКЕ
+# ==========================================
 
 async def download_file_by_url(url: str, destination: Path, status_message: types.Message) -> bool:
     """ Скачивает презентацию по HTTP-ссылке напрямую в RAM-диск (SHM). """
@@ -86,7 +129,15 @@ async def download_file_by_url(url: str, destination: Path, status_message: type
         logging.error(f"Исключение при скачивании по URL: {e}")
         return False
 
+
+# ==========================================
+# 4. ОСНОВНОЙ КОНВЕЙЕР ОБРАБОТКИ
+# ==========================================
+
 async def core_pipeline(downloaded_file_path: Path, status_message: types.Message, user_id: int, user_mgr):
+    """
+    Основной конвейер конвертации презентации.
+    """
     work_dir = downloaded_file_path.parent
     is_zip = downloaded_file_path.suffix.lower() == '.zip'
     cfg = user_mgr.get_user_config(user_id)
@@ -104,20 +155,24 @@ async def core_pipeline(downloaded_file_path: Path, status_message: types.Messag
         await status_message.edit_text(f"⏳ Конвертация через LibreOffice в RAM...\n(Качество: {cfg['quality'].upper()})")
         
         clean_folder = not cfg["keep_pdf"]
-        
         args = converter_engine.FakeArgs(
-            quality=cfg["quality"],
-            keep_pdf=cfg["keep_pdf"],
-            dark_mode=(cfg.get("theme") == "dark"),  # ← Исправить
-            zip_mode=True,
-            clean=clean_folder,
+            quality=cfg["quality"], 
+            keep_pdf=cfg["keep_pdf"], 
+            dark_mode=True, 
+            zip_mode=True, 
+            clean=clean_folder, 
             output_dir=str(work_dir)
         )
         
         # Вызов движка в фоновом пуле потоков
         await asyncio.to_thread(converter_engine.process_file_local, pptx_path, args)
         
-        expected_zip = next(work_dir.glob("*.zip"), None) if not is_zip else [f for f in work_dir.glob("*.zip") if f != downloaded_file_path][0]
+        # Находим созданный ZIP архив
+        if is_zip:
+            zip_files = [f for f in work_dir.glob("*.zip") if f != downloaded_file_path]
+            expected_zip = zip_files[0] if zip_files else None
+        else:
+            expected_zip = next(work_dir.glob("*.zip"), None)
         
         final_pdf_path = None
         if cfg["keep_pdf"]:
@@ -130,6 +185,7 @@ async def core_pipeline(downloaded_file_path: Path, status_message: types.Messag
                 shutil.rmtree(png_folder)
 
         return expected_zip, final_pdf_path
+        
     except Exception as e:
         logging.error(f"Критическая ошибка ядра: {e}")
         return None, None
