@@ -2,7 +2,9 @@ import os
 import shutil
 import logging
 import secrets
+import asyncio
 from pathlib import Path
+from typing import Optional, Set
 from aiogram import Router, F, types, Bot
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardButton, FSInputFile
@@ -10,6 +12,84 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Импортируем ВСЕ утилиты и конвейер обработки из utils.py
 from utils import extract_text_from_pptx, check_spelling, download_file_by_url, core_pipeline
+
+# ==========================================
+# ГЛОБАЛЬНЫЙ МЕНЕДЖЕР БЛОКИРОВОК ЗАДАЧ
+# ==========================================
+
+class TaskLockManager:
+    """
+    Менеджер блокировок задач для предотвращения race conditions.
+    """
+    def __init__(self):
+        # Хранит активные блокировки задач
+        self._locks: dict[str, asyncio.Lock] = {}
+        # Хранит состояния задач (idle, processing, completed, failed)
+        self._states: dict[str, str] = {}
+        # Хранит активные операции для каждой задачи
+        self._active_operations: dict[str, Set[str]] = {}
+    
+    async def acquire(self, task_id: str, operation: str) -> bool:
+        """
+        Пытается захватить блокировку задачи для выполнения операции.
+        Возвращает True если блокировка получена, иначе False.
+        """
+        # Создаём блокировку, если её нет
+        if task_id not in self._locks:
+            self._locks[task_id] = asyncio.Lock()
+        
+        # Пытаемся захватить блокировку (неблокирующий режим)
+        lock = self._locks[task_id]
+        acquired = await lock.acquire()
+        
+        if acquired:
+            # Проверяем состояние задачи
+            current_state = self._states.get(task_id, "idle")
+            if current_state in ("processing", "completed"):
+                lock.release()
+                return False
+            
+            # Устанавливаем состояние и регистрируем операцию
+            self._states[task_id] = "processing"
+            if task_id not in self._active_operations:
+                self._active_operations[task_id] = set()
+            self._active_operations[task_id].add(operation)
+            
+            return True
+        
+        return False
+    
+    def release(self, task_id: str, operation: str):
+        """
+        Освобождает блокировку задачи после завершения операции.
+        """
+        if task_id in self._locks:
+            lock = self._locks[task_id]
+            
+            # Удаляем операцию из активных
+            if task_id in self._active_operations:
+                self._active_operations[task_id].discard(operation)
+                if not self._active_operations[task_id]:
+                    # Если операций больше нет, сбрасываем состояние
+                    self._states[task_id] = "idle"
+            
+            # Освобождаем блокировку
+            if lock.locked():
+                lock.release()
+    
+    def set_completed(self, task_id: str):
+        """Отмечает задачу как завершённую."""
+        self._states[task_id] = "completed"
+        if task_id in self._active_operations:
+            self._active_operations[task_id].clear()
+    
+    def is_processing(self, task_id: str) -> bool:
+        """Проверяет, выполняется ли задача в данный момент."""
+        return self._states.get(task_id) == "processing"
+
+
+# Создаём глобальный экземпляр менеджера блокировок
+task_lock_manager = TaskLockManager()
 
 
 # Инициализируем единый роутер для этого модуля
@@ -20,36 +100,16 @@ router = Router()
 # ==========================================
 
 def safe_filename(filename: str) -> str:
-    """
-    Очищает имя файла от опасных символов и путей.
-    Удаляет:
-    - Все пути (/, \, ..)
-    - Специальные символы
-    - Оставляет только безопасные символы: буквы, цифры, точка, дефис, подчёркивание
-    
-    :param filename: Исходное имя файла от пользователя
-    :return: Безопасное имя файла
-    """
-    # Удаляем все пути (абсолютные и относительные)
-    # Берем только последний компонент пути
-    safe_name = os.path.basename(filename)
-    
-    # Удаляем все потенциально опасные символы
-    # Оставляем только: буквы (латиница и кириллица), цифры, точка, дефис, подчёркивание, пробел
+    """Очищает имя файла от опасных символов и путей."""
     import re
+    safe_name = os.path.basename(filename)
     safe_name = re.sub(r'[^\w\s.-]', '', safe_name)
-    
-    # Заменяем множественные пробелы на один
     safe_name = re.sub(r'\s+', ' ', safe_name)
-    
-    # Удаляем пробелы в начале и конце
     safe_name = safe_name.strip()
     
-    # Если имя стало пустым - генерируем безопасное имя
     if not safe_name:
         safe_name = f"file_{secrets.token_hex(4)}"
     
-    # Ограничиваем длину имени (100 символов достаточно)
     if len(safe_name) > 100:
         name, ext = os.path.splitext(safe_name)
         safe_name = name[:90] + ext
@@ -58,23 +118,14 @@ def safe_filename(filename: str) -> str:
 
 
 def validate_download_path(task_dir: Path, destination: Path) -> bool:
-    """
-    Проверяет, что путь назначения находится внутри task_dir.
-    Защита от Directory Traversal атак.
-    
-    :param task_dir: Безопасная директория задачи
-    :param destination: Проверяемый путь назначения
-    :return: True если путь безопасен, иначе False
-    """
+    """Проверяет, что путь назначения находится внутри task_dir."""
     try:
-        # Разрешаем все ссылки и нормализуем путь
         resolved_dest = destination.resolve()
         resolved_task = task_dir.resolve()
-        
-        # Проверяем, что destination находится внутри task_dir
         return resolved_dest.parent == resolved_task or resolved_dest.parent in resolved_task.parents
     except Exception:
         return False
+
 
 # ==========================================
 # 2. АДМИНСКИЕ ХЕНДЛЕРЫ
@@ -97,6 +148,7 @@ async def handle_admin_decision(callback: types.CallbackQuery, user_mgr, bot: Bo
         except Exception: pass
     await callback.answer()
 
+
 # ==========================================
 # 3. КОМАНДА СТАРТ
 # ==========================================
@@ -107,19 +159,18 @@ async def cmd_start(message: types.Message, check_access, get_settings_keyboard)
         "👋 Привет! Настройте параметры генерации:", 
         reply_markup=get_settings_keyboard(message.from_user.id))
 
+
 # ==========================================
 # 4. НАСТРОЙКИ (CALLBACK-КНОПКИ)
 # ==========================================
 @router.callback_query(F.data.startswith("set_q_"))
 async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_settings_keyboard, check_access_by_user, bot: Bot):
-    """Обработчик изменения качества изображений."""
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
     user_id = callback.from_user.id
     new_quality = callback.data.replace("set_q_", "")
-    
     user_mgr.update_user_config(user_id, "quality", new_quality)
     
     try:
@@ -132,7 +183,6 @@ async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_s
 
 @router.callback_query(F.data == "toggle_pdf")
 async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_settings_keyboard, check_access_by_user, bot: Bot):
-    """Обработчик переключения отправки PDF."""
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
@@ -140,7 +190,6 @@ async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_setting
     user_id = callback.from_user.id
     current_config = user_mgr.get_user_config(user_id)
     new_pdf_status = not current_config.get("keep_pdf", False)
-    
     user_mgr.update_user_config(user_id, "keep_pdf", new_pdf_status)
     
     try:
@@ -157,54 +206,50 @@ async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_setting
 # ==========================================
 
 def generate_task_id(chat_id: int, user_id: int, message_id: int) -> str:
-    """
-    Генерирует уникальный идентификатор задачи на основе chat_id, user_id и message_id.
-    Добавляет случайный суффикс для защиты от коллизий.
-    """
     suffix = secrets.token_hex(2)
     return f"task_{chat_id}_{user_id}_{message_id}_{suffix}"
 
+
 # ==========================================
-# 6. ОБРАБОТКА ИНТЕРАКТИВНОГО ВЫБОРА ПОЛЬЗОВАТЕЛЯ
+# 6. ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ОБНОВЛЕНИЯ КНОПОК
+# ==========================================
+
+def disable_task_buttons(task_id: str) -> InlineKeyboardBuilder:
+    """Создаёт клавиатуру с отключёнными кнопками для задачи в процессе обработки."""
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="⏳ Обработка... (Пожалуйста, подождите)",
+            callback_data=f"disabled_{task_id}"
+        )
+    )
+    return kb
+
+
+# ==========================================
+# 7. ОБРАБОТКА ИНТЕРАКТИВНОГО ВЫБОРА ПОЛЬЗОВАТЕЛЯ
 # ==========================================
 
 async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, SHM_DIR: str) -> tuple:
-    """
-    Проверяет, что пользователь является владельцем задачи.
-    Возвращает (task_dir, pptx_path) или (None, None) если проверка не пройдена.
-    """
+    """Проверяет, что пользователь является владельцем задачи."""
     task_dir = Path(SHM_DIR) / task_id
     ownership_file = task_dir / ".owner"
     
-    # Проверяем существование папки задачи
     if not task_dir.exists():
-        await callback.answer(
-            "❌ Срок действия сессии истек. Отправьте файл заново.",
-            show_alert=True
-        )
+        await callback.answer("❌ Срок действия сессии истек.", show_alert=True)
         return None, None
     
-    # Проверяем файл владельца
     if not ownership_file.exists():
-        await callback.answer(
-            "❌ Данные задачи повреждены. Отправьте файл заново.",
-            show_alert=True
-        )
+        await callback.answer("❌ Данные задачи повреждены.", show_alert=True)
         return None, None
     
-    # Читаем ID владельца (храним в формате "user_id:chat_id")
     try:
         owner_data = ownership_file.read_text().strip()
         owner_user_id, owner_chat_id = map(int, owner_data.split(":"))
     except (ValueError, IOError):
-        await callback.answer(
-            "❌ Ошибка чтения данных задачи. Отправьте файл заново.",
-            show_alert=True
-        )
+        await callback.answer("❌ Ошибка чтения данных задачи.", show_alert=True)
         return None, None
     
-    # ✅ Проверяем, что текущий пользователь - владелец
-    # ✅ Используем callback.answer() с show_alert=True вместо редактирования сообщения
     if callback.from_user.id != owner_user_id:
         await callback.answer(
             "❌ Эта задача принадлежит другому пользователю. Отправьте свой файл.",
@@ -212,7 +257,6 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
         )
         return None, None
     
-    # ✅ Проверяем, что чат совпадает (дополнительная защита)
     if callback.message.chat.id != owner_chat_id:
         await callback.answer(
             "❌ Эта задача была создана в другом чате.",
@@ -220,13 +264,9 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
         )
         return None, None
     
-    # Ищем PPTX файл
     pptx_path = next(task_dir.glob("*.pptx"), None)
     if not pptx_path:
-        await callback.answer(
-            "❌ Файл презентации не найден. Отправьте файл заново.",
-            show_alert=True
-        )
+        await callback.answer("❌ Файл презентации не найден.", show_alert=True)
         return None, None
     
     return task_dir, pptx_path
@@ -234,106 +274,127 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
 
 @router.callback_query(F.data.startswith("chk_spell:"))
 async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
-    """
-    Пользователь выбрал: Проверить орфографию.
-    """
-    # 1. Проверяем доступ для пользователя, который нажал кнопку
+    """Пользователь выбрал: Проверить орфографию."""
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
-    # 2. Извлекаем ID задачи
     task_id = callback.data.split(":")[-1]
     
-    # 3. Проверяем владельца задачи
-    task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
-    if not task_dir or not pptx_path:
-        # Ошибка уже обработана в _validate_task_ownership через callback.answer()
+    # ✅ ПРОВЕРКА НА ГОНКУ: пытаемся захватить блокировку
+    if not await task_lock_manager.acquire(task_id, "spelling"):
+        await callback.answer(
+            "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
+            show_alert=True
+        )
         return
     
-    await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
-    
-    # 4. Извлекаем текст с проверкой успешности
-    from utils import extract_text_from_pptx, check_spelling
-    extract_success, slides_text = extract_text_from_pptx(str(pptx_path))
-    
-    # 5. Если извлечение не удалось
-    if not extract_success:
-        await callback.message.edit_text(
-            "❌ **Не удалось извлечь текст из презентации.**\n\n"
-            "Возможные причины:\n"
-            "• Файл повреждён\n"
-            "• Неподдерживаемый формат PPTX\n"
-            "• Срок действия сессии истек\n\n"
-            "Вы можете продолжить конвертацию без проверки орфографии:",
-            parse_mode="Markdown"
-        )
-        # Показываем кнопку конвертации
+    try:
+        task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
+        if not task_dir or not pptx_path:
+            return
+        
+        # ✅ Отключаем кнопки, чтобы предотвратить повторные клики
+        disabled_kb = disable_task_buttons(task_id)
+        await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
+        
+        await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
+        
+        from utils import extract_text_from_pptx, check_spelling
+        extract_success, slides_text = extract_text_from_pptx(str(pptx_path))
+        
+        if not extract_success:
+            await callback.message.edit_text(
+                "❌ **Не удалось извлечь текст из презентации.**\n\n"
+                "Возможные причины:\n"
+                "• Файл повреждён\n"
+                "• Неподдерживаемый формат PPTX\n"
+                "• Срок действия сессии истек\n\n"
+                "Вы можете продолжить конвертацию без проверки орфографии:",
+                parse_mode="Markdown"
+            )
+            # ✅ Восстанавливаем кнопки (кроме удалённых задач)
+            if task_dir.exists():
+                kb = InlineKeyboardBuilder()
+                kb.row(InlineKeyboardButton(
+                    text="⚙️ Конвертировать",
+                    callback_data=f"chk_conv:{task_id}"
+                ))
+                await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+            await callback.answer()
+            return
+        
+        check_success, spelling_result = await check_spelling(slides_text)
+        
         kb = InlineKeyboardBuilder()
-        kb.row(InlineKeyboardButton(text="⚙️ Конвертировать", callback_data=f"chk_conv:{task_id}"))
-        await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+        kb.row(InlineKeyboardButton(
+            text="⚙️ Всё равно конвертировать",
+            callback_data=f"chk_conv:{task_id}"
+        ))
+        
+        if not check_success:
+            await callback.message.edit_text(
+                f"{spelling_result}\n\n"
+                "Вы можете продолжить конвертацию без проверки орфографии:",
+                parse_mode="Markdown",
+                reply_markup=kb.as_markup()
+            )
+        else:
+            await callback.message.edit_text(
+                spelling_result,
+                parse_mode="Markdown",
+                reply_markup=kb.as_markup()
+            )
+        
         await callback.answer()
-        return
-    
-    # 6. Проверяем орфографию (получаем статус и результат)
-    check_success, spelling_result = await check_spelling(slides_text)
-    
-    # 7. Кнопка для запуска конвертации после отчёта
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="⚙️ Всё равно конвертировать", callback_data=f"chk_conv:{task_id}"))
-    
-    # 8. Обработка результатов проверки
-    if not check_success:
-        # Проверка не удалась (сетевая ошибка, таймаут и т.д.)
-        await callback.message.edit_text(
-            f"{spelling_result}\n\n"
-            "Вы можете продолжить конвертацию без проверки орфографии:",
-            parse_mode="Markdown",
-            reply_markup=kb.as_markup()
-        )
-    else:
-        # Проверка выполнена успешно
-        await callback.message.edit_text(
-            spelling_result,
-            parse_mode="Markdown",
-            reply_markup=kb.as_markup()
-        )
-    
-    await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка в callback_run_speller: {e}", exc_info=True)
+        await callback.answer("❌ Произошла ошибка при проверке.", show_alert=True)
+    finally:
+        # ✅ Всегда освобождаем блокировку
+        task_lock_manager.release(task_id, "spelling")
 
 
 @router.callback_query(F.data.startswith("chk_conv:"))
 async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user):
-    """
-    Пользователь выбрал: Конвертировать.
-    """
-    # 1. Проверяем доступ для пользователя, который нажал кнопку
+    """Пользователь выбрал: Конвертировать."""
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
-    # 2. Извлекаем ID задачи
     task_id = callback.data.split(":")[-1]
     
-    # 3. Проверяем владельца задачи
-    task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
-    if not task_dir or not pptx_path:
-        # Ошибка уже обработана в _validate_task_ownership через callback.answer()
+    # ✅ ПРОВЕРКА НА ГОНКУ: пытаемся захватить блокировку
+    if not await task_lock_manager.acquire(task_id, "conversion"):
+        await callback.answer(
+            "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
+            show_alert=True
+        )
         return
     
-    user_id = callback.from_user.id
-    chat_id = callback.message.chat.id
-    
-    await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
-    
     try:
-        # Вызываем конвейер конвертации
+        task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
+        if not task_dir or not pptx_path:
+            return
+        
+        user_id = callback.from_user.id
+        chat_id = callback.message.chat.id
+        
+        # ✅ Отключаем кнопки, чтобы предотвратить повторные клики
+        disabled_kb = disable_task_buttons(task_id)
+        await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
+        
+        await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
+        
+        # ✅ Отмечаем задачу как завершённую перед удалением
+        task_lock_manager.set_completed(task_id)
+        
         expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
         
         if expected_zip and expected_zip.exists():
             await callback.message.edit_text("📤 Отправляю готовые файлы...")
             
-            # Отправляем файлы в ТОТ ЖЕ ЧАТ
             await bot.send_document(
                 chat_id=chat_id,
                 document=FSInputFile(expected_zip),
@@ -346,21 +407,25 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
                     document=FSInputFile(final_pdf_path),
                     caption="📄 PDF готов!"
                 )
-                
+            
             await callback.message.delete()
         else:
             await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
             
     except Exception as e:
-        logging.error(f"Ошибка в callback-конвертации: {e}", exc_info=True)
+        logging.error(f"Ошибка в callback_run_conversion: {e}", exc_info=True)
         await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
     finally:
-        if task_dir.exists():
+        # ✅ Очищаем задачу
+        if task_dir and task_dir.exists():
             shutil.rmtree(task_dir)
+        # ✅ Всегда освобождаем блокировку
+        task_lock_manager.release(task_id, "conversion")
     await callback.answer()
 
+
 # ==========================================
-# 7. ФАЙЛЫ И ДОКУМЕНТЫ (С ЗАЩИТОЙ ОТ TRAVERSAL)
+# 8. ФАЙЛЫ И ДОКУМЕНТЫ
 # ==========================================
 
 @router.message(F.document.file_name.endswith('.pptx'))
@@ -372,10 +437,7 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # ✅ Очищаем имя файла от опасных символов
     safe_file_name = safe_filename(document.file_name)
-    
-    # ✅ Проверяем, что расширение допустимо
     if not safe_file_name.lower().endswith(('.pptx', '.ppt')):
         await message.reply("❌ Неверный формат файла. Отправьте PPTX или PPT.")
         return
@@ -384,14 +446,10 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     
-    # Сохраняем владельца задачи
     ownership_file = task_dir / ".owner"
     ownership_file.write_text(f"{user_id}:{chat_id}")
     
-    # ✅ Формируем безопасный путь внутри task_dir
     local_file_path = task_dir / safe_file_name
-    
-    # ✅ Проверяем, что путь не выходит за пределы task_dir
     if not validate_download_path(task_dir, local_file_path):
         await message.reply("❌ Ошибка безопасности: недопустимое имя файла.")
         logging.warning(f"Security: Path traversal attempt from user {user_id}: {document.file_name}")
@@ -428,10 +486,7 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
     if not await check_access(message): 
         return
     
-    # ✅ Очищаем имя файла от опасных символов
     safe_file_name = safe_filename(message.document.file_name)
-    
-    # ✅ Проверяем, что расширение допустимо
     file_ext = Path(safe_file_name).suffix.lower()
     if file_ext not in ['.pptx', '.ppt', '.zip']:
         await message.reply("❌ Неверный формат. Отправьте PPTX, PPT или ZIP с презентацией.")
@@ -444,14 +499,10 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(exist_ok=True)
     
-    # Сохраняем владельца задачи
     ownership_file = task_dir / ".owner"
     ownership_file.write_text(f"{user_id}:{chat_id}")
     
-    # ✅ Формируем безопасный путь внутри task_dir
     download_path = task_dir / safe_file_name
-    
-    # ✅ Проверяем, что путь не выходит за пределы task_dir
     if not validate_download_path(task_dir, download_path):
         await message.reply("❌ Ошибка безопасности: недопустимое имя файла.")
         logging.warning(f"Security: Path traversal attempt from user {user_id}: {message.document.file_name}")
@@ -483,7 +534,6 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
                 )
             
             await status_message.delete()
-            
             await message.answer(
                 "⚙️ **Настройки для следующей презентации:**", 
                 reply_markup=get_settings_keyboard(user_id)
@@ -507,7 +557,7 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
 
 
 # ==========================================
-# 8. ТЕКСТОВЫЕ СООБЩЕНИЯ И ССЫЛКИ
+# 9. ТЕКСТОВЫЕ СООБЩЕНИЯ И ССЫЛКИ
 # ==========================================
 
 @router.message(F.text.contains("http://") | F.text.contains("https://"))
@@ -529,7 +579,6 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
     ownership_file = task_dir / ".owner"
     ownership_file.write_text(f"{user_id}:{chat_id}")
     
-    # ✅ Безопасное имя для скачанного файла
     safe_file_name = "downloaded_presentation.pptx"
     download_path = task_dir / safe_file_name
     
@@ -550,7 +599,6 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
                         caption="📄 PDF готов!"
                     )
                 await status_message.delete()
-                
                 await message.answer(
                     "⚙️ **Настройки для следующей презентации:**", 
                     reply_markup=get_settings_keyboard(user_id)
@@ -569,7 +617,6 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
 
 @router.message(F.text & ~F.text.contains("http://") & ~F.text.contains("https://"))
 async def handle_any_text(message: types.Message, check_access, get_settings_keyboard):
-    """Если пользователь пишет любой обычный текст (не ссылку), бот выводит актуальные настройки."""
     if not await check_access(message): 
         return
         
