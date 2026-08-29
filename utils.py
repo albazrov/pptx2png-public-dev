@@ -139,7 +139,6 @@ async def download_file_by_url(url: str, destination: Path, status_message: type
         logging.error(f"Исключение при скачивании по URL: {e}")
         return False
 
-
 # ==========================================
 # 4. ОСНОВНОЙ КОНВЕЙЕР ОБРАБОТКИ
 # ==========================================
@@ -147,12 +146,14 @@ async def download_file_by_url(url: str, destination: Path, status_message: type
 async def core_pipeline(downloaded_file_path: Path, status_message: types.Message, user_id: int, user_mgr):
     """
     Основной конвейер конвертации презентации.
+    Возвращает кортеж (путь_к_zip, путь_к_pdf) или (None, None) при ошибке.
     """
     work_dir = downloaded_file_path.parent
     is_zip = downloaded_file_path.suffix.lower() == '.zip'
     cfg = user_mgr.get_user_config(user_id)
 
     try:
+        # 1. Если загружен ZIP — распаковываем и находим PPTX
         if is_zip:
             await status_message.edit_text("📦 Распаковка ZIP...")
             pptx_path = converter_engine.extract_zip_if_needed(downloaded_file_path, work_dir)
@@ -162,6 +163,7 @@ async def core_pipeline(downloaded_file_path: Path, status_message: types.Messag
         else:
             pptx_path = downloaded_file_path
 
+        # 2. Запускаем конвертацию
         await status_message.edit_text(f"⏳ Конвертация через LibreOffice в RAM...\n(Качество: {cfg['quality'].upper()})")
         
         clean_folder = not cfg["keep_pdf"]
@@ -175,15 +177,15 @@ async def core_pipeline(downloaded_file_path: Path, status_message: types.Messag
         )
         
         # Вызов движка в фоновом пуле потоков
-        await asyncio.to_thread(converter_engine.process_file_local, pptx_path, args)
+        # ВАЖНО: process_file_local теперь возвращает путь к созданному ZIP
+        expected_zip = await asyncio.to_thread(converter_engine.process_file_local, pptx_path, args)
         
-        # Находим созданный ZIP архив
-        if is_zip:
-            zip_files = [f for f in work_dir.glob("*.zip") if f != downloaded_file_path]
-            expected_zip = zip_files[0] if zip_files else None
-        else:
-            expected_zip = next(work_dir.glob("*.zip"), None)
+        # Проверяем, что ZIP действительно создан
+        if not expected_zip or not expected_zip.exists():
+            await status_message.edit_text("❌ Ошибка: ZIP архив не создан.")
+            return None, None
         
+        # 3. Обработка PDF (если пользователь хочет его сохранить)
         final_pdf_path = None
         if cfg["keep_pdf"]:
             png_folder = next((d for d in work_dir.iterdir() if d.is_dir() and d.name.endswith("_output")), None)
@@ -192,10 +194,15 @@ async def core_pipeline(downloaded_file_path: Path, status_message: types.Messag
                 if pdf_file:
                     final_pdf_path = work_dir / f"{pptx_path.stem}.pdf"
                     shutil.move(str(pdf_file), str(final_pdf_path))
+                # Удаляем временную папку с PNG и PDF
                 shutil.rmtree(png_folder)
+
+        # 4. Если это был ZIP, удаляем исходный загруженный архив
+        if is_zip and downloaded_file_path.exists():
+            downloaded_file_path.unlink()
 
         return expected_zip, final_pdf_path
         
     except Exception as e:
-        logging.error(f"Критическая ошибка ядра: {e}")
+        logging.error(f"Критическая ошибка ядра: {e}", exc_info=True)
         return None, None
