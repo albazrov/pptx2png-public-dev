@@ -1,6 +1,12 @@
 import aiohttp
 import logging
-from pptx import Presentation  # Требуется: pip install python-pptx
+import shutil
+from pathlib import Path
+from aiogram import Bot, types
+from pptx import Presentation
+
+# Импортируем ваш существующий движок рендеринга
+import converter_engine
 
 async def check_spelling(text_list: list) -> str:
     """
@@ -65,20 +71,19 @@ def extract_text_from_pptx(file_path: str) -> list:
         return []
 
 async def download_file_by_url(url: str, destination: Path, status_message: types.Message) -> bool:
+    """ Скачивает презентацию по HTTP-ссылке напрямую в RAM-диск (SHM). """
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
+            async with session.get(url, timeout=30) as response:
                 if response.status != 200:
-                    await status_message.edit_text(f"❌ Ошибка загрузки. Статус: {response.status}")
+                    logging.error(f"Ошибка скачивания по ссылке. Статус: {response.status}")
                     return False
-                with open(destination, 'wb') as f:
-                    while True:
-                        chunk = await response.content.read(1024 * 1024)
-                        if not chunk: break
-                        f.write(chunk)
-        return True
+                
+                with open(destination, "wb") as f:
+                    f.write(await response.read())
+                return True
     except Exception as e:
-        await status_message.edit_text(f"❌ Ошибка HTTP-загрузки: {e}")
+        logging.error(f"Исключение при скачивании по URL: {e}")
         return False
 
 async def core_pipeline(downloaded_file_path: Path, status_message: types.Message, user_id: int):
