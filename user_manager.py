@@ -56,12 +56,14 @@ class UserManager:
                 f.write(f"{user_id}\n")
 
     def get_user_config(self, user_id: int) -> dict:
-        """Возвращает настройки генерации для конкретного пользователя."""
-        if user_id not in self.user_settings:
-            # Создаем стандартные дефолты для нового ID
-            self.user_settings[user_id] = {"quality": "2k", "keep_pdf": False}
-            self._save_settings()
-        return self.user_settings[user_id]
+    if user_id not in self.user_settings:
+        self.user_settings[user_id] = {
+            "quality": "2k",
+            "keep_pdf": False,
+            "theme": "original"  # ← Добавить
+        }
+        self._save_settings()
+    return self.user_settings[user_id]
 
     def update_user_config(self, user_id: int, key: str, value):
         """Обновляет параметр пользователя и сразу перезаписывает файл на диске."""
