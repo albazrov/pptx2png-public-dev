@@ -154,6 +154,20 @@ async def check_access(message: types.Message) -> bool:
         await message.reply("🔒 Доступ ограничен. Ошибка уведомления админа.")
     return False
 
+# ==========================================================
+# ПРОПИСЫВАНИЕ ЗАВИСИМОСТЕЙ:
+# ==========================================================
+dp.workflow_data.update({
+    "SHM_DIR": str(SHM_DIR),
+    "user_mgr": user_mgr,
+    "check_access": check_access,
+    "get_settings_keyboard": get_settings_keyboard,
+    "bot": bot  # Передаем сам объект бота для отправки файлов и работы админки
+})
+
+# 3. ПОДКЛЮЧАЕМ НАШ ВНЕШНИЙ РОУТЕР (строго после workflow_data.update!)
+dp.include_router(main_router)
+
 async def main():
     """Основная функция запуска Telegram-бота."""
     logging.info("Модульный бот запущен на /dev/shm...")
