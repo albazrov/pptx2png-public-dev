@@ -18,6 +18,8 @@ import aiohttp
 # ИМПОРТ НАШИХ КАСТОМНЫХ МОДУЛЕЙ
 import converter_engine
 from user_manager import UserManager
+from utils import extract_text_from_pptx, check_spelling  # НАШ НОВЫЙ ИМПОРТ
+
 
 # 1. Определение директории запуска скрипта и имени родительской папки (prod / test)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
