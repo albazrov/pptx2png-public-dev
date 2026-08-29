@@ -271,17 +271,103 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
     
     return task_dir, pptx_path
 
-
-@router.callback_query(F.data.startswith("chk_spell:"))
-async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
-    """Пользователь выбрал: Проверить орфографию."""
+@router.callback_query(F.data.startswith("chk_conv:"))
+async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user):
+    """
+    Пользователь выбрал: Конвертировать.
+    """
+    # 1. Проверяем доступ для пользователя, который нажал кнопку
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
+    # 2. Извлекаем ID задачи
     task_id = callback.data.split(":")[-1]
     
-    # ✅ ПРОВЕРКА НА ГОНКУ: пытаемся захватить блокировку
+    # ✅ Инициализируем переменные ДО try, чтобы они были доступны в finally
+    task_dir = None
+    task_id_for_cleanup = task_id  # Сохраняем для очистки блокировки
+    
+    # ✅ Пытаемся захватить блокировку
+    if not await task_lock_manager.acquire(task_id, "conversion"):
+        await callback.answer(
+            "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
+            show_alert=True
+        )
+        return
+    
+    try:
+        # 3. Проверяем владельца задачи
+        task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
+        if not task_dir or not pptx_path:
+            return
+        
+        user_id = callback.from_user.id
+        chat_id = callback.message.chat.id
+        
+        # Отключаем кнопки, чтобы предотвратить повторные клики
+        disabled_kb = disable_task_buttons(task_id)
+        await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
+        
+        await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
+        
+        # Отмечаем задачу как завершённую перед удалением
+        task_lock_manager.set_completed(task_id)
+        
+        expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
+        
+        if expected_zip and expected_zip.exists():
+            await callback.message.edit_text("📤 Отправляю готовые файлы...")
+            
+            await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(expected_zip),
+                caption=f"📦 ZIP с картинками готов! ({callback.from_user.full_name})"
+            )
+            
+            if final_pdf_path and final_pdf_path.exists():
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=FSInputFile(final_pdf_path),
+                    caption="📄 PDF готов!"
+                )
+            
+            await callback.message.delete()
+        else:
+            await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
+            
+    except Exception as e:
+        logging.error(f"Ошибка в callback_run_conversion: {e}", exc_info=True)
+        await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
+    finally:
+        # ✅ Безопасная очистка: проверяем, что task_dir был присвоен
+        if task_dir is not None and task_dir.exists():
+            shutil.rmtree(task_dir)
+        
+        # ✅ Всегда освобождаем блокировку
+        task_lock_manager.release(task_id_for_cleanup, "conversion")
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("chk_spell:"))
+async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
+    """
+    Пользователь выбрал: Проверить орфографию.
+    """
+    # 1. Проверяем доступ для пользователя, который нажал кнопку
+    if not await check_access_by_user(callback.from_user, bot):
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    
+    # 2. Извлекаем ID задачи
+    task_id = callback.data.split(":")[-1]
+    
+    # ✅ Инициализируем переменные ДО try
+    task_dir = None
+    task_id_for_cleanup = task_id
+    
+    # ✅ Пытаемся захватить блокировку
     if not await task_lock_manager.acquire(task_id, "spelling"):
         await callback.answer(
             "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
@@ -290,11 +376,12 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         return
     
     try:
+        # 3. Проверяем владельца задачи
         task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
         if not task_dir or not pptx_path:
             return
         
-        # ✅ Отключаем кнопки, чтобы предотвратить повторные клики
+        # Отключаем кнопки, чтобы предотвратить повторные клики
         disabled_kb = disable_task_buttons(task_id)
         await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
         
@@ -313,8 +400,8 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
                 "Вы можете продолжить конвертацию без проверки орфографии:",
                 parse_mode="Markdown"
             )
-            # ✅ Восстанавливаем кнопки (кроме удалённых задач)
-            if task_dir.exists():
+            # Восстанавливаем кнопки (кроме удалённых задач)
+            if task_dir is not None and task_dir.exists():
                 kb = InlineKeyboardBuilder()
                 kb.row(InlineKeyboardButton(
                     text="⚙️ Конвертировать",
@@ -352,76 +439,12 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         logging.error(f"Ошибка в callback_run_speller: {e}", exc_info=True)
         await callback.answer("❌ Произошла ошибка при проверке.", show_alert=True)
     finally:
-        # ✅ Всегда освобождаем блокировку
-        task_lock_manager.release(task_id, "spelling")
-
-
-@router.callback_query(F.data.startswith("chk_conv:"))
-async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user):
-    """Пользователь выбрал: Конвертировать."""
-    if not await check_access_by_user(callback.from_user, bot):
-        await callback.answer("❌ Доступ запрещен.", show_alert=True)
-        return
-    
-    task_id = callback.data.split(":")[-1]
-    
-    # ✅ ПРОВЕРКА НА ГОНКУ: пытаемся захватить блокировку
-    if not await task_lock_manager.acquire(task_id, "conversion"):
-        await callback.answer(
-            "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
-            show_alert=True
-        )
-        return
-    
-    try:
-        task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
-        if not task_dir or not pptx_path:
-            return
-        
-        user_id = callback.from_user.id
-        chat_id = callback.message.chat.id
-        
-        # ✅ Отключаем кнопки, чтобы предотвратить повторные клики
-        disabled_kb = disable_task_buttons(task_id)
-        await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
-        
-        await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
-        
-        # ✅ Отмечаем задачу как завершённую перед удалением
-        task_lock_manager.set_completed(task_id)
-        
-        expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
-        
-        if expected_zip and expected_zip.exists():
-            await callback.message.edit_text("📤 Отправляю готовые файлы...")
-            
-            await bot.send_document(
-                chat_id=chat_id,
-                document=FSInputFile(expected_zip),
-                caption=f"📦 ZIP с картинками готов! ({callback.from_user.full_name})"
-            )
-            
-            if final_pdf_path and final_pdf_path.exists():
-                await bot.send_document(
-                    chat_id=chat_id,
-                    document=FSInputFile(final_pdf_path),
-                    caption="📄 PDF готов!"
-                )
-            
-            await callback.message.delete()
-        else:
-            await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
-            
-    except Exception as e:
-        logging.error(f"Ошибка в callback_run_conversion: {e}", exc_info=True)
-        await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
-    finally:
-        # ✅ Очищаем задачу
-        if task_dir and task_dir.exists():
+        # ✅ Безопасная очистка
+        if task_dir is not None and task_dir.exists():
             shutil.rmtree(task_dir)
+        
         # ✅ Всегда освобождаем блокировку
-        task_lock_manager.release(task_id, "conversion")
-    await callback.answer()
+        task_lock_manager.release(task_id_for_cleanup, "spelling")
 
 
 # ==========================================
