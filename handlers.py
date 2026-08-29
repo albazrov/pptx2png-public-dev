@@ -344,7 +344,6 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
     
     return task_dir, pptx_path
 
-
 @router.callback_query(F.data.startswith("chk_spell:"))
 async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
     """Пользователь выбрал: Проверить орфографию."""
@@ -376,7 +375,7 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         
         from utils import extract_text_from_pptx, check_spelling
         
-        # ✅ Выносим синхронную операцию в поток
+        # Выносим синхронную операцию в поток
         extract_success, slides_text = await asyncio.to_thread(
             extract_text_from_pptx, 
             str(pptx_path)
@@ -392,13 +391,13 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
                 "Вы можете продолжить конвертацию без проверки орфографии:",
                 parse_mode="Markdown"
             )
-            if task_dir is not None and task_dir.exists():
-                kb = InlineKeyboardBuilder()
-                kb.row(InlineKeyboardButton(
-                    text="⚙️ Конвертировать",
-                    callback_data=f"chk_conv:{task_id}"
-                ))
-                await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+            # Восстанавливаем кнопки
+            kb = InlineKeyboardBuilder()
+            kb.row(InlineKeyboardButton(
+                text="⚙️ Конвертировать",
+                callback_data=f"chk_conv:{task_id}"
+            ))
+            await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
             await callback.answer()
             return
         
@@ -430,8 +429,8 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         logging.error(f"Ошибка в callback_run_speller: {e}", exc_info=True)
         await callback.answer("❌ Произошла ошибка при проверке.", show_alert=True)
     finally:
-        if task_dir is not None and task_dir.exists():
-            shutil.rmtree(task_dir)
+        # ✅ НЕ УДАЛЯЕМ task_dir — он нужен для конвертации!
+        # Очистка будет выполнена после конвертации или через cleanup_expired
         task_lock_manager.release(task_id_for_cleanup, "spelling")
 
 
