@@ -175,19 +175,44 @@ async def cmd_start(message: types.Message):
     if not await check_access(message): return
     await message.reply("👋 Привет! Настройте параметры генерации:", reply_markup=get_settings_keyboard(message.from_user.id))
 
+# === ОБРАБОТЧИКИ НАСТРОЕК (ИНЛАЙН-КНОПКИ) ===
+
 @dp.callback_query(F.data.startswith("set_q_"))
-async def handle_quality_change(callback: types.CallbackQuery):
-    new_q = callback.data.replace("set_q_", "")
-    user_mgr.get_user_config(callback.from_user.id)["quality"] = new_q
-    await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard(callback.from_user.id))
-    await callback.answer(f"Качество: {new_q.upper()}")
+async def handle_quality_settings(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    # Извлекаем выбранное качество из callback_data (standard, 2k, 4k)
+    new_quality = callback.data.replace("set_q_", "")
+    
+    # Записываем новое качество в JSON-базу данных через UserManager
+    user_mgr.update_user_config(user_id, "quality", new_quality)
+    
+    # Перерисовываем клавиатуру с актуальными галочками ✅
+    try:
+        await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard(user_id))
+        await callback.answer(f"Quality updated to: {new_quality.upper()}")
+    except Exception as e:
+        logging.error(f"Error updating quality keyboard: {e}")
+        await callback.answer()
 
 @dp.callback_query(F.data == "toggle_pdf")
-async def handle_pdf_toggle(callback: types.CallbackQuery):
-    cfg = user_mgr.get_user_config(callback.from_user.id)
-    cfg["keep_pdf"] = not cfg["keep_pdf"]
-    await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard(callback.from_user.id))
-    await callback.answer(f"Возврат PDF {'включен' if cfg['keep_pdf'] else 'выключен'}.")
+async def handle_toggle_pdf(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    current_config = user_mgr.get_user_config(user_id)
+    
+    # Инвертируем текущий флаг отправки PDF (True -> False / False -> True)
+    new_pdf_status = not current_config.get("keep_pdf", False)
+    
+    # Сохраняем измененный статус в JSON
+    user_mgr.update_user_config(user_id, "keep_pdf", new_pdf_status)
+    
+    # Обновляем инлайн-кнопки
+    try:
+        await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard(user_id))
+        status_text = "Да (ZIP + PDF)" if new_pdf_status else "Нет (Только ZIP)"
+        await callback.answer(f"PDF output: {status_text}")
+    except Exception as e:
+        logging.error(f"Error toggling PDF keyboard: {e}")
+        await callback.answer()
 
 async def download_file_by_url(url: str, destination: Path, status_message: types.Message) -> bool:
     try:
