@@ -17,7 +17,7 @@ router = Router()
 # 1. АДМИНСКИЕ ХЕНДЛЕРЫ
 # ==========================================
 @router.callback_query(F.data.startswith("adm_"))
-async def handle_admin_decision(callback: types.CallbackQuery):
+async def handle_admin_decision(callback: types.CallbackQuery, user_mgr, bot: Bot, ADMIN_ID: int):
     if callback.from_user.id != ADMIN_ID:
         return
     data = callback.data.split("_")
@@ -38,16 +38,17 @@ async def handle_admin_decision(callback: types.CallbackQuery):
 # 2. КОМАНДА СТАРТ
 # ==========================================
 @router.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, check_access, get_settings_keyboard):
     if not await check_access(message): return
-    await message.reply("👋 Привет! Настройте параметры генерации:", reply_markup=get_settings_keyboard(message.from_user.id))
-
+    await message.reply(
+        "👋 Привет! Настройте параметры генерации:", 
+        reply_markup=get_settings_keyboard(message.from_user.id))
 
 # ==========================================
 # 3. НАСТРОЙКИ (CALLBACK-КНОПКИ)
 # ==========================================
 @router.callback_query(F.data.startswith("set_q_"))
-async def handle_quality_settings(callback: types.CallbackQuery):
+async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_settings_keyboard):
     user_id = callback.from_user.id
     # Извлекаем выбранное качество из callback_data (standard, 2k, 4k)
     new_quality = callback.data.replace("set_q_", "")
@@ -64,7 +65,7 @@ async def handle_quality_settings(callback: types.CallbackQuery):
         await callback.answer()
 
 @router.callback_query(F.data == "toggle_pdf")
-async def handle_toggle_pdf(callback: types.CallbackQuery):
+async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_settings_keyboard):
     user_id = callback.from_user.id
     current_config = user_mgr.get_user_config(user_id)
     
@@ -145,7 +146,7 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, u
 # Б. ШИРОКИЙ ФИЛЬТР: Все остальные типы файлов (PDF, Картинки, Архивы)
 
 @@router.message(F.document)
-async def handle_docs(message: types.Message):
+async def handle_docs(message: types.Message, check_access):
     if not await check_access(message): return
     file_name = message.document.file_name
     if Path(file_name).suffix.lower() not in ['.pptx', '.ppt', '.zip']:
@@ -184,7 +185,7 @@ async def handle_docs(message: types.Message):
 # 5. ТЕКСТОВЫЕ СООБЩЕНИЯ И ССЫЛКИ
 # ==========================================
 @router.message(F.text.contains("http://") | F.text.contains("https://"))
-async def handle_links(message: types.Message):
+async def handle_links(message: types.Message, check_access):
     if not await check_access(message): return
     direct_url = converter_engine.convert_to_direct_download(message.text)
     
@@ -213,7 +214,7 @@ async def handle_links(message: types.Message):
         if task_dir.exists(): shutil.rmtree(task_dir)
 
 @router.message(F.text & ~F.text.contains("http://") & ~F.text.contains("https://"))
-async def handle_any_text(message: types.Message):
+async def handle_any_text(message: types.Message, check_access):
     """Если пользователь пишет любой обычный текст (не ссылку), бот выводит актуальные настройки."""
     if not await check_access(message): 
         return
