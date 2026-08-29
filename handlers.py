@@ -257,6 +257,7 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
         return
     
     user_id = callback.from_user.id
+    chat_id = callback.message.chat.id  # ✅ Сохраняем ID чата, где была создана задача
     
     await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
     
@@ -264,22 +265,32 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
         # Вызываем конвейер конвертации
         expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
         
-        if expected_zip:
+        if expected_zip and expected_zip.exists():
             await callback.message.edit_text("📤 Отправляю готовые файлы...")
             
-            # Отправляем ZIP
-            await bot.send_document(chat_id=user_id, document=FSInputFile(expected_zip))
+            # ✅ Отправляем файлы в ТОТ ЖЕ ЧАТ, где была создана задача
+            # Это может быть как личный чат, так и группа
+            await bot.send_document(
+                chat_id=chat_id,  # ✅ Используем chat_id из callback
+                document=FSInputFile(expected_zip),
+                caption="📦 ZIP с картинками готов!"
+            )
             
             # Если пользователь просил PDF
             if final_pdf_path and final_pdf_path.exists():
-                await bot.send_document(chat_id=user_id, document=FSInputFile(final_pdf_path))
+                await bot.send_document(
+                    chat_id=chat_id,  # ✅ Используем chat_id из callback
+                    document=FSInputFile(final_pdf_path),
+                    caption="📄 PDF готов!"
+                )
                 
+            # Удаляем статусное сообщение после отправки
             await callback.message.delete()
         else:
             await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
             
     except Exception as e:
-        logging.error(f"Ошибка в callback-конвертации: {e}")
+        logging.error(f"Ошибка в callback-конвертации: {e}", exc_info=True)
         await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
     finally:
         if task_dir.exists():
