@@ -162,7 +162,8 @@ dp.workflow_data.update({
     "user_mgr": user_mgr,
     "check_access": check_access,
     "get_settings_keyboard": get_settings_keyboard,
-    "bot": bot  # Передаем сам объект бота для отправки файлов и работы админки
+    "bot": bot,  # Передаем сам объект бота для отправки файлов и работы админки
+    "ADMIN_ID": ADMIN_ID
 })
 
 # 3. ПОДКЛЮЧАЕМ НАШ ВНЕШНИЙ РОУТЕР (строго после workflow_data.update!)
