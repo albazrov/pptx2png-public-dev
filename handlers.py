@@ -209,7 +209,7 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
 
 # Б. ШИРОКИЙ ФИЛЬТР: Все остальные типы файлов (PDF, Картинки, Архивы)
 
-@@router.message(F.document)
+@router.message(F.document)
 async def handle_docs(message: types.Message, check_access):
     if not await check_access(message): return
     file_name = message.document.file_name
