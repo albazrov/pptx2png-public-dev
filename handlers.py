@@ -162,7 +162,14 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
             shutil.rmtree(task_dir)
     await callback.answer()
 
-
+@router.callback_query(F.data.startswith("set_t_"))
+async def handle_theme_settings(callback: types.CallbackQuery, user_mgr, get_settings_keyboard):
+    user_id = callback.from_user.id
+    new_theme = callback.data.replace("set_t_", "")
+    user_mgr.update_user_config(user_id, "theme", new_theme)
+    await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard(user_id))
+    await callback.answer(f"Theme: {new_theme}")
+    
 # ==========================================
 # 4. ФАЙЛЫ И ДОКУМЕНТЫ (СТРОГИЙ ПОРЯДОК СВЕРХУ ВНИЗ)
 # ==========================================
