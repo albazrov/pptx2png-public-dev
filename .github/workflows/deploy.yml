@@ -1,0 +1,62 @@
+name: CI/CD pptx2png
+
+on:
+  push:
+    branches:
+      - test
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  deploy-and-test:
+    runs-on: [self-hosted, raspberry]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- ЛОГИКА ДЛЯ ТЕСТОВОЙ ВЕТКИ ---
+      - name: Deploy and Test on Test Branch
+        if: github.ref == 'refs/heads/test'
+        run: |
+          # Копируем код, игнорируя локальный рабочий конфиг тестовой папки
+          rsync -av --exclude='.git*' --exclude='config*' --exclude='allowed_users*' ./ /home/pi/app/pptx2png/test/
+          
+          cd /home/pi/app/pptx2png/test/
+          
+          # Запуск тестового бота ровно на 15 секунд
+          timeout 30s /home/pi/.venv/bin/python3 bot.py > debug.log 2>&1 || true
+          
+          cp debug.log ${{ github.workspace }}/debug.log
+
+      - name: Commit and Push Log to GitHub
+        if: github.ref == 'refs/heads/test'
+        run: |
+          git config --global user.name "Raspberry Runner"
+          git config --global user.email "runner@raspberry.local"
+          
+          if [ -f debug.log ]; then
+            git add debug.log
+            git commit -m "Chore: update debug.log [skip ci]" || echo "No changes"
+            git push origin test
+          fi
+
+      # --- ЛОГИКА ДЛЯ РАБОЧЕЙ ВЕТКИ (ПРОДАКШН) ---
+      - name: Deploy to Production Branch
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # 1. Синхронизируем код, строго исключая перезапись боевого config/allowed_users
+          rsync -av --exclude='.git*' --exclude='debug.log' --exclude='config*' --exclude='allowed_users*' ./ /home/pi/app/pptx2png/prod/
+          
+          # 2. Автоматический перезапуск продакшн-бота через manage.sh
+          cd /home/pi/app/pptx2png/prod/
+          chmod +x manage.sh
+          
+          # Отвязываем фоновый процесс от сессии GitHub Runner
+          env RUNNER_TRACKING_ID=0 ./manage.sh restart || echo "Failed to restart, check manage.sh"
+          
+          # Проверяем статус для логов GitHub Actions
+          sleep 1
+          ./manage.sh status
