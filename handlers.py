@@ -85,64 +85,127 @@ async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_setting
         logging.error(f"Error toggling PDF keyboard: {e}")
         await callback.answer()
 
+# --- ОБРАБОТКА ИНТЕРАКТИВНОГО ВЫБОРА ПОЛЬЗОВАТЕЛЯ ---
+
+@router.callback_query(F.data.startswith("chk_spell:"))
+async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str):
+    """ Пользователь выбрал: Проверить орфографию. """
+    task_id = callback.data.split(":")[-1]
+    task_dir = Path(SHM_DIR) / task_id
+    
+    # Ищем наш .pptx файл внутри временной папки в RAM
+    pptx_path = next(task_dir.glob("*.pptx"), None)
+    
+    if not pptx_path:
+        await callback.message.edit_text("❌ Срок действия сессии истек или файл не найден. Отправьте файл заново.")
+        return
+        
+    await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
+    
+    # Извлекаем и проверяем (функции из utils.py)
+    from utils import extract_text_from_pptx, check_spelling
+    slides_text = extract_text_from_pptx(str(pptx_path))
+    spelling_report = await check_spelling(slides_text)
+    
+    # Кнопка для запуска конвертации после отчета
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="⚙️ Всё равно конвертировать", callback_data=f"chk_conv:{task_id}"))
+    
+    if spelling_report:
+        # Если ошибки есть, выводим отчет и кнопку принудительной конвертации
+        await callback.message.edit_text(spelling_report, parse_mode="Markdown", reply_markup=kb.as_markup())
+    else:
+        # Если ошибок нет
+        await callback.message.edit_text("✨ **Яндекс.Спеллер не нашёл опечаток!** Всё чисто.", parse_mode="Markdown", reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("chk_conv:"))
+async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr):
+    """ Пользователь выбрал: Конвертировать. """
+    task_id = callback.data.split(":")[-1]
+    task_dir = Path(SHM_DIR) / task_id
+    user_id = callback.from_user.id
+    
+    pptx_path = next(task_dir.glob("*.pptx"), None)
+    if not pptx_path:
+        await callback.message.edit_text("❌ Файл не найден в оперативной памяти. Отправьте заново.")
+        return
+        
+    await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
+    
+    from utils import core_pipeline
+    try:
+        # Вызываем вашу оригинальную чистую функцию конвертации (которую вы прислали)
+        expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id)
+        
+        if expected_zip:
+            await callback.message.edit_text("📤 Отправляю готовые файлы...")
+            
+            # Отправляем ZIP
+            await bot.send_document(chat_id=user_id, document=types.FSInputFile(expected_zip))
+            
+            # Если пользователь просил PDF
+            if final_pdf_path and final_pdf_path.exists():
+                await bot.send_document(chat_id=user_id, document=types.FSInputFile(final_pdf_path))
+                
+            await callback.message.delete()  # Удаляем статусное сообщение
+        else:
+            await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
+            
+    except Exception as e:
+        logging.error(f"Ошибка в callback-конвертации: {e}")
+        await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
+    finally:
+        # Полностью очищаем оперативную память RAM-диска после отправки результатов
+        if task_dir.exists():
+            shutil.rmtree(task_dir)
+    await callback.answer()
+
+
 # ==========================================
 # 4. ФАЙЛЫ И ДОКУМЕНТЫ (СТРОГИЙ ПОРЯДОК СВЕРХУ ВНИЗ)
 # ==========================================
 
-# А. УЗКИЙ ФИЛЬТР: Только презентации .pptx (Проверка орфографии + Конвертация)
 @router.message(F.document.file_name.endswith('.pptx'))
-async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, user_mgr, check_access):
-    """
-    Хендлер перехватывает файлы .pptx, извлекает текст, отправляет в Яндекс.Спеллер 
-    и затем передает на конвертацию.
-    """
-    # 1. Проверяем доступ пользователя через переданную функцию
+async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, check_access):
     if not await check_access(message):
         return
 
     document = message.document
-    
-    # Создаем изолированную временную подпапку для задачи внутри RAM-диска (SHM)
-    task_dir = Path(SHM_DIR) / f"task_{message.message_id}"
+    # Создаем имя папки на основе ID сообщения, чтобы связать сессию с callback_data
+    task_id = f"td_{message.message_id}"
+    task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     
     local_file_path = task_dir / document.file_name
-    status_msg = await message.reply("⏳ Скачиваю презентацию...")
+    status_msg = await message.reply("⏳ Скачиваю презентацию в память...")
     
     try:
-        # 2. Скачиваем файл напрямую в RAM-диск
+        # Скачиваем файл из Telegram напрямую в RAM-диск
         file_info = await bot.get_file(document.file_id)
         await bot.download_file(file_info.file_path, destination=local_file_path)
         
-        # 3. ЛИНГВИСТИЧЕСКИЙ АНАЛИЗ (Вызов из utils.py)
-        await status_msg.edit_text("🔍 Извлекаю текст и проверяю орфографию через Яндекс.Спеллер...")
+        # Строим инлайн-клавиатуру инфо-диалога
+        kb = InlineKeyboardBuilder()
+        # В callback_data зашиваем маркер действия и уникальный ID папки задачи
+        kb.row(
+            InlineKeyboardButton(text="🔍 Проверить ошибки", callback_data=f"chk_spell:{task_id}"),
+            InlineKeyboardButton(text="⚙️ Конвертировать", callback_data=f"chk_conv:{task_id}")
+        )
         
-        # Парсим строки слайдов через python-pptx
-        slides_text = extract_text_from_pptx(str(local_file_path))
-        
-        # Отправляем асинхронный JSON-запрос в API Яндекса
-        spelling_report = await check_spelling(slides_text)
-        
-        # Если найдены опечатки — выводим отчет отдельным сообщением
-        if spelling_report:
-            await message.reply(spelling_report, parse_mode="Markdown")
-        
-        # 4. ДВИЖОК КОНВЕРТАЦИИ
-        await status_msg.edit_text("⚙️ Запускаю конвертацию слайдов в PNG...")
-        
-        # Здесь будет вызываться ваш converter_engine
-        # converter_engine.process(...)
-        
-        await status_msg.delete()
+        await status_msg.edit_text(
+            f"📄 **Файл '{document.file_name}' успешно загружен.**\n\n"
+            "Желаете проверить текст слайдов на орфографические ошибки через Яндекс.Спеллер перед рендерингом?",
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup()
+        )
         
     except Exception as e:
-        logging.error(f"Ошибка при обработке файла в роутере: {e}")
-        await status_msg.edit_text("❌ Произошла ошибка при обработке файла.")
-    finally:
-        # Полностью очищаем оперативную память после завершения сессии
+        logging.error(f"Ошибка при загрузке файла: {e}")
+        await status_msg.edit_text("❌ Произошла ошибка при загрузке файла.")
         if task_dir.exists():
             shutil.rmtree(task_dir)
-
 
 # Б. ШИРОКИЙ ФИЛЬТР: Все остальные типы файлов (PDF, Картинки, Архивы)
 
