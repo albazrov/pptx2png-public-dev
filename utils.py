@@ -15,7 +15,7 @@ async def check_spelling(text_list: list) -> str:
     :param text_list: Список строк с текстом каждого слайда
     :return: Форматированный Markdown-отчет об ошибках или пустая строка, если опечаток нет.
     """
-    url = "https://yandex.net"
+    url = "https://speller.yandex.net/services/spellservice.json/checkText"
     report_lines = []
     
     async with aiohttp.ClientSession() as session:
