@@ -104,9 +104,14 @@ async def core_pipeline(downloaded_file_path: Path, status_message: types.Messag
         await status_message.edit_text(f"⏳ Конвертация через LibreOffice в RAM...\n(Качество: {cfg['quality'].upper()})")
         
         clean_folder = not cfg["keep_pdf"]
+        
         args = converter_engine.FakeArgs(
-            quality=cfg["quality"], keep_pdf=cfg["keep_pdf"], 
-            dark_mode=True, zip_mode=True, clean=clean_folder, output_dir=str(work_dir)
+            quality=cfg["quality"],
+            keep_pdf=cfg["keep_pdf"],
+            dark_mode=(cfg.get("theme") == "dark"),  # ← Исправить
+            zip_mode=True,
+            clean=clean_folder,
+            output_dir=str(work_dir)
         )
         
         # Вызов движка в фоновом пуле потоков
