@@ -4,7 +4,7 @@ import logging
 import secrets
 import asyncio
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional, Set, Dict
 from aiogram import Router, F, types, Bot
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardButton, FSInputFile
@@ -14,82 +14,149 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from utils import extract_text_from_pptx, check_spelling, download_file_by_url, core_pipeline
 
 # ==========================================
-# ГЛОБАЛЬНЫЙ МЕНЕДЖЕР БЛОКИРОВОК ЗАДАЧ
+# ГЛОБАЛЬНЫЙ МЕНЕДЖЕР БЛОКИРОВОК ЗАДАЧ (С ОЧИСТКОЙ)
 # ==========================================
 
 class TaskLockManager:
     """
     Менеджер блокировок задач для предотвращения race conditions.
+    Автоматически удаляет записи после завершения всех операций.
     """
     def __init__(self):
         # Хранит активные блокировки задач
-        self._locks: dict[str, asyncio.Lock] = {}
-        # Хранит состояния задач (idle, processing, completed, failed)
-        self._states: dict[str, str] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        # Хранит состояния задач (idle, processing, completed, expired)
+        self._states: Dict[str, str] = {}
         # Хранит активные операции для каждой задачи
-        self._active_operations: dict[str, Set[str]] = {}
+        self._active_operations: Dict[str, Set[str]] = {}
+        # Хранит время последней активности (для автоматической очистки)
+        self._last_activity: Dict[str, float] = {}
+        # Блокировка для безопасного доступа к словарям
+        self._dict_lock = asyncio.Lock()
     
     async def acquire(self, task_id: str, operation: str) -> bool:
         """
         Пытается захватить блокировку задачи для выполнения операции.
         Возвращает True если блокировка получена, иначе False.
         """
-        # Создаём блокировку, если её нет
-        if task_id not in self._locks:
-            self._locks[task_id] = asyncio.Lock()
-        
-        # Пытаемся захватить блокировку (неблокирующий режим)
-        lock = self._locks[task_id]
-        acquired = await lock.acquire()
-        
-        if acquired:
+        async with self._dict_lock:
+            # Создаём блокировку, если её нет
+            if task_id not in self._locks:
+                self._locks[task_id] = asyncio.Lock()
+            
             # Проверяем состояние задачи
             current_state = self._states.get(task_id, "idle")
             if current_state in ("processing", "completed"):
-                lock.release()
                 return False
             
-            # Устанавливаем состояние и регистрируем операцию
-            self._states[task_id] = "processing"
-            if task_id not in self._active_operations:
-                self._active_operations[task_id] = set()
-            self._active_operations[task_id].add(operation)
+            # Пытаемся захватить блокировку (неблокирующий режим)
+            lock = self._locks[task_id]
+            acquired = lock.locked() or await asyncio.shield(lock.acquire())
             
-            return True
-        
-        return False
+            if acquired:
+                # Устанавливаем состояние и регистрируем операцию
+                self._states[task_id] = "processing"
+                if task_id not in self._active_operations:
+                    self._active_operations[task_id] = set()
+                self._active_operations[task_id].add(operation)
+                self._last_activity[task_id] = asyncio.get_event_loop().time()
+                return True
+            
+            return False
     
     def release(self, task_id: str, operation: str):
         """
         Освобождает блокировку задачи после завершения операции.
+        Если операций больше нет, удаляет все записи.
         """
-        if task_id in self._locks:
-            lock = self._locks[task_id]
-            
-            # Удаляем операцию из активных
-            if task_id in self._active_operations:
-                self._active_operations[task_id].discard(operation)
-                if not self._active_operations[task_id]:
-                    # Если операций больше нет, сбрасываем состояние
-                    self._states[task_id] = "idle"
-            
-            # Освобождаем блокировку
-            if lock.locked():
-                lock.release()
+        async def _release_internal():
+            async with self._dict_lock:
+                if task_id not in self._locks:
+                    return
+                
+                # Удаляем операцию из активных
+                if task_id in self._active_operations:
+                    self._active_operations[task_id].discard(operation)
+                    
+                    # Если операций больше нет
+                    if not self._active_operations[task_id]:
+                        # Удаляем все записи для этой задачи
+                        self._locks.pop(task_id, None)
+                        self._states.pop(task_id, None)
+                        self._active_operations.pop(task_id, None)
+                        self._last_activity.pop(task_id, None)
+                        return
+                
+                # Обновляем время последней активности
+                self._last_activity[task_id] = asyncio.get_event_loop().time()
+                
+                # Освобождаем блокировку, если она существует
+                if task_id in self._locks:
+                    lock = self._locks[task_id]
+                    if lock.locked():
+                        lock.release()
+        
+        # Запускаем очистку в фоне, чтобы не блокировать
+        asyncio.create_task(_release_internal())
     
     def set_completed(self, task_id: str):
-        """Отмечает задачу как завершённую."""
-        self._states[task_id] = "completed"
-        if task_id in self._active_operations:
-            self._active_operations[task_id].clear()
+        """Отмечает задачу как завершённую и удаляет записи."""
+        async def _complete_internal():
+            async with self._dict_lock:
+                if task_id in self._states:
+                    self._states[task_id] = "completed"
+                
+                # Удаляем все записи через 5 секунд (даём время на завершение)
+                await asyncio.sleep(5)
+                async with self._dict_lock:
+                    self._locks.pop(task_id, None)
+                    self._states.pop(task_id, None)
+                    self._active_operations.pop(task_id, None)
+                    self._last_activity.pop(task_id, None)
+        
+        asyncio.create_task(_complete_internal())
     
     def is_processing(self, task_id: str) -> bool:
         """Проверяет, выполняется ли задача в данный момент."""
         return self._states.get(task_id) == "processing"
+    
+    async def cleanup_expired(self, max_age: float = 3600):
+        """
+        Автоматическая очистка устаревших записей.
+        max_age - максимальное время жизни записи в секундах (по умолчанию 1 час).
+        """
+        async with self._dict_lock:
+            current_time = asyncio.get_event_loop().time()
+            expired = []
+            
+            for task_id, last_active in self._last_activity.items():
+                if current_time - last_active > max_age:
+                    expired.append(task_id)
+            
+            for task_id in expired:
+                self._locks.pop(task_id, None)
+                self._states.pop(task_id, None)
+                self._active_operations.pop(task_id, None)
+                self._last_activity.pop(task_id, None)
+                logging.debug(f"🧹 Очищена устаревшая запись задачи: {task_id}")
 
 
 # Создаём глобальный экземпляр менеджера блокировок
 task_lock_manager = TaskLockManager()
+
+
+# ==========================================
+# ФОНОВАЯ ЗАДАЧА ДЛЯ ПЕРИОДИЧЕСКОЙ ОЧИСТКИ
+# ==========================================
+
+async def cleanup_loop():
+    """Фоновый цикл для периодической очистки устаревших задач."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Каждые 5 минут
+            await task_lock_manager.cleanup_expired()
+        except Exception as e:
+            logging.error(f"Ошибка в цикле очистки: {e}")
 
 
 # Инициализируем единый роутер для этого модуля
@@ -271,102 +338,19 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
     
     return task_dir, pptx_path
 
-@router.callback_query(F.data.startswith("chk_conv:"))
-async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user):
-    """
-    Пользователь выбрал: Конвертировать.
-    """
-    # 1. Проверяем доступ для пользователя, который нажал кнопку
-    if not await check_access_by_user(callback.from_user, bot):
-        await callback.answer("❌ Доступ запрещен.", show_alert=True)
-        return
-    
-    # 2. Извлекаем ID задачи
-    task_id = callback.data.split(":")[-1]
-    
-    # ✅ Инициализируем переменные ДО try, чтобы они были доступны в finally
-    task_dir = None
-    task_id_for_cleanup = task_id  # Сохраняем для очистки блокировки
-    
-    # ✅ Пытаемся захватить блокировку
-    if not await task_lock_manager.acquire(task_id, "conversion"):
-        await callback.answer(
-            "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
-            show_alert=True
-        )
-        return
-    
-    try:
-        # 3. Проверяем владельца задачи
-        task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
-        if not task_dir or not pptx_path:
-            return
-        
-        user_id = callback.from_user.id
-        chat_id = callback.message.chat.id
-        
-        # Отключаем кнопки, чтобы предотвратить повторные клики
-        disabled_kb = disable_task_buttons(task_id)
-        await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
-        
-        await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
-        
-        # Отмечаем задачу как завершённую перед удалением
-        task_lock_manager.set_completed(task_id)
-        
-        expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
-        
-        if expected_zip and expected_zip.exists():
-            await callback.message.edit_text("📤 Отправляю готовые файлы...")
-            
-            await bot.send_document(
-                chat_id=chat_id,
-                document=FSInputFile(expected_zip),
-                caption=f"📦 ZIP с картинками готов! ({callback.from_user.full_name})"
-            )
-            
-            if final_pdf_path and final_pdf_path.exists():
-                await bot.send_document(
-                    chat_id=chat_id,
-                    document=FSInputFile(final_pdf_path),
-                    caption="📄 PDF готов!"
-                )
-            
-            await callback.message.delete()
-        else:
-            await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
-            
-    except Exception as e:
-        logging.error(f"Ошибка в callback_run_conversion: {e}", exc_info=True)
-        await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
-    finally:
-        # ✅ Безопасная очистка: проверяем, что task_dir был присвоен
-        if task_dir is not None and task_dir.exists():
-            shutil.rmtree(task_dir)
-        
-        # ✅ Всегда освобождаем блокировку
-        task_lock_manager.release(task_id_for_cleanup, "conversion")
-    
-    await callback.answer()
 
 @router.callback_query(F.data.startswith("chk_spell:"))
 async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
-    """
-    Пользователь выбрал: Проверить орфографию.
-    """
-    # 1. Проверяем доступ для пользователя, который нажал кнопку
+    """Пользователь выбрал: Проверить орфографию."""
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
-    # 2. Извлекаем ID задачи
     task_id = callback.data.split(":")[-1]
     
-    # Инициализируем переменные ДО try
     task_dir = None
     task_id_for_cleanup = task_id
     
-    # Пытаемся захватить блокировку
     if not await task_lock_manager.acquire(task_id, "spelling"):
         await callback.answer(
             "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
@@ -375,23 +359,18 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         return
     
     try:
-        # 3. Проверяем владельца задачи
         task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
         if not task_dir or not pptx_path:
             return
         
-        # Отключаем кнопки, чтобы предотвратить повторные клики
         disabled_kb = disable_task_buttons(task_id)
         await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
         
         await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
         
-        # ✅ ВЫНОСИМ СИНХРОННУЮ ОПЕРАЦИЮ В ПОТОК
-        # Это предотвращает блокировку event loop при парсинге больших презентаций
         from utils import extract_text_from_pptx, check_spelling
         
-        # ✅ Запускаем extract_text_from_pptx в отдельном потоке
-        # Это позволяет event loop продолжать обработку других запросов
+        # ✅ Выносим синхронную операцию в поток
         extract_success, slides_text = await asyncio.to_thread(
             extract_text_from_pptx, 
             str(pptx_path)
@@ -407,7 +386,6 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
                 "Вы можете продолжить конвертацию без проверки орфографии:",
                 parse_mode="Markdown"
             )
-            # Восстанавливаем кнопки (кроме удалённых задач)
             if task_dir is not None and task_dir.exists():
                 kb = InlineKeyboardBuilder()
                 kb.row(InlineKeyboardButton(
@@ -418,7 +396,6 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
             await callback.answer()
             return
         
-        # ✅ check_spelling уже асинхронная, её не нужно оборачивать
         check_success, spelling_result = await check_spelling(slides_text)
         
         kb = InlineKeyboardBuilder()
@@ -447,12 +424,76 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         logging.error(f"Ошибка в callback_run_speller: {e}", exc_info=True)
         await callback.answer("❌ Произошла ошибка при проверке.", show_alert=True)
     finally:
-        # Безопасная очистка
         if task_dir is not None and task_dir.exists():
             shutil.rmtree(task_dir)
-        
-        # Всегда освобождаем блокировку
         task_lock_manager.release(task_id_for_cleanup, "spelling")
+
+
+@router.callback_query(F.data.startswith("chk_conv:"))
+async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user):
+    """Пользователь выбрал: Конвертировать."""
+    if not await check_access_by_user(callback.from_user, bot):
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    
+    task_id = callback.data.split(":")[-1]
+    
+    task_dir = None
+    task_id_for_cleanup = task_id
+    
+    if not await task_lock_manager.acquire(task_id, "conversion"):
+        await callback.answer(
+            "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
+            show_alert=True
+        )
+        return
+    
+    try:
+        task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
+        if not task_dir or not pptx_path:
+            return
+        
+        user_id = callback.from_user.id
+        chat_id = callback.message.chat.id
+        
+        disabled_kb = disable_task_buttons(task_id)
+        await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
+        
+        await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
+        
+        task_lock_manager.set_completed(task_id)
+        
+        expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
+        
+        if expected_zip and expected_zip.exists():
+            await callback.message.edit_text("📤 Отправляю готовые файлы...")
+            
+            await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(expected_zip),
+                caption=f"📦 ZIP с картинками готов! ({callback.from_user.full_name})"
+            )
+            
+            if final_pdf_path and final_pdf_path.exists():
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=FSInputFile(final_pdf_path),
+                    caption="📄 PDF готов!"
+                )
+            
+            await callback.message.delete()
+        else:
+            await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
+            
+    except Exception as e:
+        logging.error(f"Ошибка в callback_run_conversion: {e}", exc_info=True)
+        await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
+    finally:
+        if task_dir is not None and task_dir.exists():
+            shutil.rmtree(task_dir)
+        task_lock_manager.release(task_id_for_cleanup, "conversion")
+    await callback.answer()
+
 
 # ==========================================
 # 8. ФАЙЛЫ И ДОКУМЕНТЫ
@@ -656,3 +697,4 @@ async def handle_any_text(message: types.Message, check_access, get_settings_key
         "Настройте качество картинок и режим сохранения PDF перед отправкой презентации.", 
         reply_markup=get_settings_keyboard(user_id)
     )
+    
