@@ -164,48 +164,69 @@ def generate_task_id(chat_id: int, user_id: int, message_id: int) -> str:
     suffix = secrets.token_hex(2)
     return f"task_{chat_id}_{user_id}_{message_id}_{suffix}"
 
-
 # ==========================================
 # 6. ОБРАБОТКА ИНТЕРАКТИВНОГО ВЫБОРА ПОЛЬЗОВАТЕЛЯ
 # ==========================================
 
 async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, SHM_DIR: str) -> tuple:
-    """Проверяет, что пользователь является владельцем задачи."""
+    """
+    Проверяет, что пользователь является владельцем задачи.
+    Возвращает (task_dir, pptx_path) или (None, None) если проверка не пройдена.
+    """
     task_dir = Path(SHM_DIR) / task_id
     ownership_file = task_dir / ".owner"
     
+    # Проверяем существование папки задачи
     if not task_dir.exists():
-        await callback.message.edit_text("❌ Срок действия сессии истек. Отправьте файл заново.")
-        await callback.answer()
+        await callback.answer(
+            "❌ Срок действия сессии истек. Отправьте файл заново.",
+            show_alert=True
+        )
         return None, None
     
+    # Проверяем файл владельца
     if not ownership_file.exists():
-        await callback.message.edit_text("❌ Данные задачи повреждены. Отправьте файл заново.")
-        await callback.answer()
+        await callback.answer(
+            "❌ Данные задачи повреждены. Отправьте файл заново.",
+            show_alert=True
+        )
         return None, None
     
+    # Читаем ID владельца (храним в формате "user_id:chat_id")
     try:
         owner_data = ownership_file.read_text().strip()
         owner_user_id, owner_chat_id = map(int, owner_data.split(":"))
     except (ValueError, IOError):
-        await callback.message.edit_text("❌ Ошибка чтения данных задачи. Отправьте файл заново.")
-        await callback.answer()
+        await callback.answer(
+            "❌ Ошибка чтения данных задачи. Отправьте файл заново.",
+            show_alert=True
+        )
         return None, None
     
+    # ✅ Проверяем, что текущий пользователь - владелец
+    # ✅ Используем callback.answer() с show_alert=True вместо редактирования сообщения
     if callback.from_user.id != owner_user_id:
-        await callback.message.edit_text("❌ Эта задача принадлежит другому пользователю. Отправьте свой файл.")
-        await callback.answer()
+        await callback.answer(
+            "❌ Эта задача принадлежит другому пользователю. Отправьте свой файл.",
+            show_alert=True
+        )
         return None, None
     
+    # ✅ Проверяем, что чат совпадает (дополнительная защита)
     if callback.message.chat.id != owner_chat_id:
-        await callback.message.edit_text("❌ Эта задача была создана в другом чате.")
-        await callback.answer()
+        await callback.answer(
+            "❌ Эта задача была создана в другом чате.",
+            show_alert=True
+        )
         return None, None
     
+    # Ищем PPTX файл
     pptx_path = next(task_dir.glob("*.pptx"), None)
     if not pptx_path:
-        await callback.message.edit_text("❌ Файл презентации не найден. Отправьте файл заново.")
-        await callback.answer()
+        await callback.answer(
+            "❌ Файл презентации не найден. Отправьте файл заново.",
+            show_alert=True
+        )
         return None, None
     
     return task_dir, pptx_path
@@ -213,22 +234,30 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
 
 @router.callback_query(F.data.startswith("chk_spell:"))
 async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
-    """Пользователь выбрал: Проверить орфографию."""
+    """
+    Пользователь выбрал: Проверить орфографию.
+    """
+    # 1. Проверяем доступ для пользователя, который нажал кнопку
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
+    # 2. Извлекаем ID задачи
     task_id = callback.data.split(":")[-1]
     
+    # 3. Проверяем владельца задачи
     task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
     if not task_dir or not pptx_path:
+        # Ошибка уже обработана в _validate_task_ownership через callback.answer()
         return
     
     await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
     
+    # 4. Извлекаем текст с проверкой успешности
     from utils import extract_text_from_pptx, check_spelling
     extract_success, slides_text = extract_text_from_pptx(str(pptx_path))
     
+    # 5. Если извлечение не удалось
     if not extract_success:
         await callback.message.edit_text(
             "❌ **Не удалось извлечь текст из презентации.**\n\n"
@@ -239,18 +268,23 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
             "Вы можете продолжить конвертацию без проверки орфографии:",
             parse_mode="Markdown"
         )
+        # Показываем кнопку конвертации
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(text="⚙️ Конвертировать", callback_data=f"chk_conv:{task_id}"))
         await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
         await callback.answer()
         return
     
+    # 6. Проверяем орфографию (получаем статус и результат)
     check_success, spelling_result = await check_spelling(slides_text)
     
+    # 7. Кнопка для запуска конвертации после отчёта
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="⚙️ Всё равно конвертировать", callback_data=f"chk_conv:{task_id}"))
     
+    # 8. Обработка результатов проверки
     if not check_success:
+        # Проверка не удалась (сетевая ошибка, таймаут и т.д.)
         await callback.message.edit_text(
             f"{spelling_result}\n\n"
             "Вы можете продолжить конвертацию без проверки орфографии:",
@@ -258,6 +292,7 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
             reply_markup=kb.as_markup()
         )
     else:
+        # Проверка выполнена успешно
         await callback.message.edit_text(
             spelling_result,
             parse_mode="Markdown",
@@ -269,15 +304,21 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
 
 @router.callback_query(F.data.startswith("chk_conv:"))
 async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user):
-    """Пользователь выбрал: Конвертировать."""
+    """
+    Пользователь выбрал: Конвертировать.
+    """
+    # 1. Проверяем доступ для пользователя, который нажал кнопку
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
+    # 2. Извлекаем ID задачи
     task_id = callback.data.split(":")[-1]
     
+    # 3. Проверяем владельца задачи
     task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
     if not task_dir or not pptx_path:
+        # Ошибка уже обработана в _validate_task_ownership через callback.answer()
         return
     
     user_id = callback.from_user.id
@@ -286,11 +327,13 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
     await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
     
     try:
+        # Вызываем конвейер конвертации
         expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
         
         if expected_zip and expected_zip.exists():
             await callback.message.edit_text("📤 Отправляю готовые файлы...")
             
+            # Отправляем файлы в ТОТ ЖЕ ЧАТ
             await bot.send_document(
                 chat_id=chat_id,
                 document=FSInputFile(expected_zip),
@@ -315,7 +358,6 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
         if task_dir.exists():
             shutil.rmtree(task_dir)
     await callback.answer()
-
 
 # ==========================================
 # 7. ФАЙЛЫ И ДОКУМЕНТЫ (С ЗАЩИТОЙ ОТ TRAVERSAL)
