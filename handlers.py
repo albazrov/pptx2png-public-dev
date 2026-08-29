@@ -154,20 +154,51 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
     
     await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
     
-    # Извлекаем и проверяем (функции из utils.py)
-    slides_text = extract_text_from_pptx(str(pptx_path))
-    spelling_report = await check_spelling(slides_text)
+    # 4. Извлекаем текст с проверкой успешности
+    extract_success, slides_text = extract_text_from_pptx(str(pptx_path))
     
-    # Кнопка для запуска конвертации после отчета
+    # 5. Если извлечение не удалось
+    if not extract_success:
+        await callback.message.edit_text(
+            "❌ **Не удалось извлечь текст из презентации.**\n\n"
+            "Возможные причины:\n"
+            "• Файл повреждён\n"
+            "• Неподдерживаемый формат PPTX\n"
+            "• Срок действия сессии истек\n\n"
+            "Вы можете продолжить конвертацию без проверки орфографии:",
+            parse_mode="Markdown"
+        )
+        # Показываем кнопку конвертации
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="⚙️ Конвертировать", callback_data=f"chk_conv:{task_id}"))
+        await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+        await callback.answer()
+        return
+    
+    # 6. Проверяем орфографию (получаем статус и результат)
+    check_success, spelling_result = await check_spelling(slides_text)
+    
+    # 7. Кнопка для запуска конвертации после отчёта
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="⚙️ Всё равно конвертировать", callback_data=f"chk_conv:{task_id}"))
     
-    if spelling_report:
-        # Если ошибки есть, выводим отчет и кнопку принудительной конвертации
-        await callback.message.edit_text(spelling_report, parse_mode="Markdown", reply_markup=kb.as_markup())
+    # 8. Обработка результатов проверки
+    if not check_success:
+        # Проверка не удалась (сетевая ошибка, таймаут и т.д.)
+        await callback.message.edit_text(
+            f"{spelling_result}\n\n"
+            "Вы можете продолжить конвертацию без проверки орфографии:",
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup()
+        )
     else:
-        # Если ошибок нет
-        await callback.message.edit_text("✨ **Яндекс.Спеллер не нашёл опечаток!** Всё чисто.", parse_mode="Markdown", reply_markup=kb.as_markup())
+        # Проверка выполнена успешно
+        await callback.message.edit_text(
+            spelling_result,
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup()
+        )
+    
     await callback.answer()
 
 
@@ -219,8 +250,6 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
         if task_dir.exists():
             shutil.rmtree(task_dir)
     await callback.answer()
-
-
 # ==========================================
 # 5. ФАЙЛЫ И ДОКУМЕНТЫ
 # ==========================================
