@@ -305,14 +305,16 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
         if task_dir.exists():
             shutil.rmtree(task_dir)
 
-
 @router.message(F.document)
 async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_access, user_mgr, get_settings_keyboard):
     if not await check_access(message): 
         return
     
     file_name = message.document.file_name
-    if Path(file_name).suffix.lower() not in ['.pptx', '.ppt', '.zip']:
+    file_ext = Path(file_name).suffix.lower()
+    
+    # Проверяем поддерживаемые форматы
+    if file_ext not in ['.pptx', '.ppt', '.zip']:
         await message.reply("❌ Неверный формат. Отправьте PPTX или ZIP с презентацией.")
         return
 
@@ -321,6 +323,7 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(exist_ok=True)
     
+    # Сохраняем владельца задачи
     ownership_file = task_dir / ".owner"
     ownership_file.write_text(str(user_id))
     
@@ -334,28 +337,49 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
             await status_message.edit_text("❌ Ошибка загрузки файла. Попробуйте еще раз.")
             return
         
+        # Запускаем конвейер обработки
         output_zip, output_pdf = await core_pipeline(download_path, status_message, user_id, user_mgr)
         
-        if output_zip:
+        if output_zip and output_zip.exists():
             await status_message.edit_text("📤 Отправка результатов...")
-            await message.reply_document(document=FSInputFile(path=output_zip), caption="📦 ZIP с картинками готов!")
-            if output_pdf:
-                await message.reply_document(document=FSInputFile(path=output_pdf), caption="📄 PDF готов!")
+            
+            # Отправляем ZIP с картинками
+            await message.reply_document(
+                document=FSInputFile(path=output_zip), 
+                caption="📦 ZIP с картинками готов!"
+            )
+            
+            # Отправляем PDF, если он есть
+            if output_pdf and output_pdf.exists():
+                await message.reply_document(
+                    document=FSInputFile(path=output_pdf), 
+                    caption="📄 PDF готов!"
+                )
+            
             await status_message.delete()
             
-            await message.answer("⚙️ **Настройки для следующей презентации:**", reply_markup=get_settings_keyboard(user_id))
+            # Показываем настройки для следующей презентации
+            await message.answer(
+                "⚙️ **Настройки для следующей презентации:**", 
+                reply_markup=get_settings_keyboard(user_id)
+            )
         else:
-            await status_message.edit_text("❌ Ошибка сборки файлов.")
+            await status_message.edit_text("❌ Ошибка сборки файлов. Попробуйте еще раз.")
+            
     except Exception as e:
-        if "file is too big" in str(e).lower() or "bad request" in str(e).lower():
-            await status_message.edit_text("❌ Ошибка: Файл превышает лимит Telegram (20 МБ).\nИспользуйте отправку ссылкой Google Drive.")
+        error_msg = str(e).lower()
+        if "file is too big" in error_msg or "bad request" in error_msg:
+            await status_message.edit_text(
+                "❌ Ошибка: Файл превышает лимит Telegram (20 МБ).\n"
+                "Используйте отправку ссылкой Google Drive."
+            )
         else:
             await status_message.edit_text(f"❌ Ошибка: {e}")
-            logging.error(f"Ошибка в handle_docs: {e}")
+            logging.error(f"Ошибка в handle_docs: {e}", exc_info=True)
     finally:
+        # Очищаем временную папку
         if task_dir.exists():
             shutil.rmtree(task_dir)
-
 
 # ==========================================
 # 6. ТЕКСТОВЫЕ СООБЩЕНИЯ И ССЫЛКИ
