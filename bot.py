@@ -123,6 +123,8 @@ def get_settings_keyboard(user_id):
     q_2k  = "✅ 2K" if cfg["quality"] == "2k" else "2K"
     q_4k  = "✅ 4K" if cfg["quality"] == "4k" else "4K"
     pdf_status = "✅ Да (ZIP + PDF)" if cfg["keep_pdf"] else "❌ Нет (Только ZIP)"
+    theme_original = "✅ Оригинал" if cfg.get("theme") == "original" else "Оригинал"
+    theme_dark = "✅ Тёмная 🌙" if cfg.get("theme") == "dark" else "Тёмная 🌙"
     
     builder = InlineKeyboardBuilder()
     builder.row(
