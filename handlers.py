@@ -102,12 +102,18 @@ class TaskLockManager:
     def set_completed(self, task_id: str):
         """Отмечает задачу как завершённую и удаляет записи."""
         async def _complete_internal():
+            # ✅ 1. Захватываем блокировку, отмечаем состояние
             async with self._dict_lock:
                 if task_id in self._states:
                     self._states[task_id] = "completed"
-                
-                # Удаляем все записи через 5 секунд (даём время на завершение)
-                await asyncio.sleep(5)
+                # Запоминаем, что нужно удалить
+                should_remove = task_id in self._locks
+            
+            # ✅ 2. Выходим из блокировки, ждём 5 секунд
+            await asyncio.sleep(5)
+            
+            # ✅ 3. Снова захватываем блокировку для удаления
+            if should_remove:
                 async with self._dict_lock:
                     self._locks.pop(task_id, None)
                     self._states.pop(task_id, None)
