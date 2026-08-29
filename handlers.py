@@ -349,7 +349,6 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
     
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("chk_spell:"))
 async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
     """
@@ -363,11 +362,11 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
     # 2. Извлекаем ID задачи
     task_id = callback.data.split(":")[-1]
     
-    # ✅ Инициализируем переменные ДО try
+    # Инициализируем переменные ДО try
     task_dir = None
     task_id_for_cleanup = task_id
     
-    # ✅ Пытаемся захватить блокировку
+    # Пытаемся захватить блокировку
     if not await task_lock_manager.acquire(task_id, "spelling"):
         await callback.answer(
             "⏳ Задача уже обрабатывается. Пожалуйста, подождите.",
@@ -387,8 +386,16 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         
         await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
         
+        # ✅ ВЫНОСИМ СИНХРОННУЮ ОПЕРАЦИЮ В ПОТОК
+        # Это предотвращает блокировку event loop при парсинге больших презентаций
         from utils import extract_text_from_pptx, check_spelling
-        extract_success, slides_text = extract_text_from_pptx(str(pptx_path))
+        
+        # ✅ Запускаем extract_text_from_pptx в отдельном потоке
+        # Это позволяет event loop продолжать обработку других запросов
+        extract_success, slides_text = await asyncio.to_thread(
+            extract_text_from_pptx, 
+            str(pptx_path)
+        )
         
         if not extract_success:
             await callback.message.edit_text(
@@ -411,6 +418,7 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
             await callback.answer()
             return
         
+        # ✅ check_spelling уже асинхронная, её не нужно оборачивать
         check_success, spelling_result = await check_spelling(slides_text)
         
         kb = InlineKeyboardBuilder()
@@ -439,13 +447,12 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         logging.error(f"Ошибка в callback_run_speller: {e}", exc_info=True)
         await callback.answer("❌ Произошла ошибка при проверке.", show_alert=True)
     finally:
-        # ✅ Безопасная очистка
+        # Безопасная очистка
         if task_dir is not None and task_dir.exists():
             shutil.rmtree(task_dir)
         
-        # ✅ Всегда освобождаем блокировку
+        # Всегда освобождаем блокировку
         task_lock_manager.release(task_id_for_cleanup, "spelling")
-
 
 # ==========================================
 # 8. ФАЙЛЫ И ДОКУМЕНТЫ
