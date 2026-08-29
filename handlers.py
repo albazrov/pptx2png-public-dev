@@ -49,15 +49,18 @@ async def cmd_start(message: types.Message, check_access, get_settings_keyboard)
 # 3. НАСТРОЙКИ (CALLBACK-КНОПКИ)
 # ==========================================
 @router.callback_query(F.data.startswith("set_q_"))
-async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_settings_keyboard):
+async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_settings_keyboard, check_access_by_user, bot: Bot):
+    """Обработчик изменения качества изображений."""
+    # Проверяем доступ для пользователя, который нажал кнопку
+    if not await check_access_by_user(callback.from_user, bot):
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    
     user_id = callback.from_user.id
-    # Извлекаем выбранное качество из callback_data (standard, 2k, 4k)
     new_quality = callback.data.replace("set_q_", "")
     
-    # Записываем новое качество в JSON-базу данных через UserManager
     user_mgr.update_user_config(user_id, "quality", new_quality)
     
-    # Перерисовываем клавиатуру с актуальными галочками ✅
     try:
         await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard(user_id))
         await callback.answer(f"Quality updated to: {new_quality.upper()}")
@@ -65,18 +68,21 @@ async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_s
         logging.error(f"Error updating quality keyboard: {e}")
         await callback.answer()
 
+
 @router.callback_query(F.data == "toggle_pdf")
-async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_settings_keyboard):
+async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_settings_keyboard, check_access_by_user, bot: Bot):
+    """Обработчик переключения отправки PDF."""
+    # Проверяем доступ для пользователя, который нажал кнопку
+    if not await check_access_by_user(callback.from_user, bot):
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    
     user_id = callback.from_user.id
     current_config = user_mgr.get_user_config(user_id)
-    
-    # Инвертируем текущий флаг отправки PDF (True -> False / False -> True)
     new_pdf_status = not current_config.get("keep_pdf", False)
     
-    # Сохраняем измененный статус в JSON
     user_mgr.update_user_config(user_id, "keep_pdf", new_pdf_status)
     
-    # Обновляем инлайн-кнопки
     try:
         await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard(user_id))
         status_text = "Да (ZIP + PDF)" if new_pdf_status else "Нет (Только ZIP)"
@@ -84,6 +90,7 @@ async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_setting
     except Exception as e:
         logging.error(f"Error toggling PDF keyboard: {e}")
         await callback.answer()
+
 
 # ==========================================
 # 4. ОБРАБОТКА ИНТЕРАКТИВНОГО ВЫБОРА ПОЛЬЗОВАТЕЛЯ
@@ -135,12 +142,12 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
 
 
 @router.callback_query(F.data.startswith("chk_spell:"))
-async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access):
+async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
     """
     Пользователь выбрал: Проверить орфографию.
     """
-    # 1. Проверяем доступ пользователя
-    if not await check_access(callback.message):
+    # 1. Проверяем доступ для пользователя, который нажал кнопку
+    if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
@@ -155,6 +162,7 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
     await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
     
     # 4. Извлекаем текст с проверкой успешности
+    from utils import extract_text_from_pptx, check_spelling
     extract_success, slides_text = extract_text_from_pptx(str(pptx_path))
     
     # 5. Если извлечение не удалось
@@ -203,12 +211,12 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
 
 
 @router.callback_query(F.data.startswith("chk_conv:"))
-async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access):
+async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user):
     """
     Пользователь выбрал: Конвертировать.
     """
-    # 1. Проверяем доступ пользователя
-    if not await check_access(callback.message):
+    # 1. Проверяем доступ для пользователя, который нажал кнопку
+    if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     
@@ -225,7 +233,7 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
     await callback.message.edit_text("⚙️ Запускаю конвейер LibreOffice...")
     
     try:
-        # Вызываем вашу оригинальную чистую функцию конвертации
+        # Вызываем конвейер конвертации
         expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
         
         if expected_zip:
@@ -238,7 +246,7 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
             if final_pdf_path and final_pdf_path.exists():
                 await bot.send_document(chat_id=user_id, document=FSInputFile(final_pdf_path))
                 
-            await callback.message.delete()  # Удаляем статусное сообщение
+            await callback.message.delete()
         else:
             await callback.message.edit_text("❌ Ошибка генерации файлов движком.")
             
@@ -246,10 +254,11 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
         logging.error(f"Ошибка в callback-конвертации: {e}")
         await callback.message.edit_text("❌ Произошла ошибка при конвертации.")
     finally:
-        # Полностью очищаем оперативную память RAM-диска после отправки результатов
         if task_dir.exists():
             shutil.rmtree(task_dir)
     await callback.answer()
+
+
 # ==========================================
 # 5. ФАЙЛЫ И ДОКУМЕНТЫ
 # ==========================================
@@ -262,12 +271,11 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
     document = message.document
     user_id = message.from_user.id
     
-    # Создаем имя папки на основе ID сообщения, чтобы связать сессию с callback_data
     task_id = f"td_{message.message_id}"
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     
-    # --- СОХРАНЯЕМ ID ВЛАДЕЛЬЦА ЗАДАЧИ ---
+    # Сохраняем ID владельца задачи
     ownership_file = task_dir / ".owner"
     ownership_file.write_text(str(user_id))
     
@@ -275,13 +283,10 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
     status_msg = await message.reply("⏳ Скачиваю презентацию в память...")
     
     try:
-        # Скачиваем файл из Telegram напрямую в RAM-диск
         file_info = await bot.get_file(document.file_id)
         await bot.download_file(file_info.file_path, destination=local_file_path)
         
-        # Строим инлайн-клавиатуру инфо-диалога
         kb = InlineKeyboardBuilder()
-        # В callback_data зашиваем маркер действия и уникальный ID папки задачи
         kb.row(
             InlineKeyboardButton(text="🔍 Проверить ошибки", callback_data=f"chk_spell:{task_id}"),
             InlineKeyboardButton(text="⚙️ Конвертировать", callback_data=f"chk_conv:{task_id}")
@@ -316,7 +321,6 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(exist_ok=True)
     
-    # --- СОХРАНЯЕМ ID ВЛАДЕЛЬЦА ЗАДАЧИ ---
     ownership_file = task_dir / ".owner"
     ownership_file.write_text(str(user_id))
     
@@ -326,7 +330,6 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
         download_path = task_dir / file_name
         await bot.download(file=message.document.file_id, destination=str(download_path))
         
-        # Проверяем, что файл действительно скачался
         if not download_path.exists() or download_path.stat().st_size == 0:
             await status_message.edit_text("❌ Ошибка загрузки файла. Попробуйте еще раз.")
             return
@@ -340,7 +343,6 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
                 await message.reply_document(document=FSInputFile(path=output_pdf), caption="📄 PDF готов!")
             await status_message.delete()
             
-            # Автоматический вывод кнопок после отправки
             await message.answer("⚙️ **Настройки для следующей презентации:**", reply_markup=get_settings_keyboard(user_id))
         else:
             await status_message.edit_text("❌ Ошибка сборки файлов.")
@@ -364,7 +366,6 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
     if not await check_access(message):
         return
     
-    # Импортируем converter_engine для преобразования ссылок
     import converter_engine
     
     direct_url = converter_engine.convert_to_direct_download(message.text)
@@ -374,7 +375,6 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(exist_ok=True)
     
-    # --- СОХРАНЯЕМ ID ВЛАДЕЛЬЦА ЗАДАЧИ ---
     ownership_file = task_dir / ".owner"
     ownership_file.write_text(str(user_id))
     
@@ -391,7 +391,6 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
                     await message.reply_document(document=FSInputFile(path=output_pdf), caption="📄 PDF готов!")
                 await status_message.delete()
                 
-                # Автоматический вывод кнопок после отправки
                 await message.answer("⚙️ **Настройки для следующей презентации:**", reply_markup=get_settings_keyboard(user_id))
             else:
                 await status_message.edit_text("❌ Ошибка конвертации по ссылке.")
