@@ -55,18 +55,15 @@
 **Воркфлоу:** `.github/workflows/deploy.yml`
 
 [Push в main/test] → [GitHub Actions] → [Self-Hosted Runner на Pi]
-                          │
-┌─────────────────────────┴─────────────────────────┐
-▼ (ветка test)                                      ▼ (ветка main)
-
-rsync кода в /test/                                 rsync кода в /prod/
-./manage.sh stop
-2. ./manage.sh restart
-./manage.sh start
-3. ./manage.sh status
-Проверка статуса
-Сбор логов → Артефакты
-./manage.sh stop (тест)
+                                              │
+                    ┌─────────────────────────┴─────────────────────────┐
+                    ▼ (ветка test)                                     ▼ (ветка main)
+              1. rsync кода в /test/                             1. rsync кода в /prod/
+              2. ./manage.sh stop                               2. ./manage.sh restart
+              3. ./manage.sh start                              3. ./manage.sh status
+              4. Проверка статуса
+              5. Сбор логов → Артефакты
+              6. ./manage.sh stop (тест)
 
 
 
@@ -125,6 +122,25 @@ tar xzf actions-runner-linux-arm64.tar.gz
 main → Production (/app/pptx2png/prod)
 test → Testing (/app/pptx2png/test)
 Файл .github/workflows/deploy.yml — см. пример в репозитории.
+
+📁 Структура проекта
+pptx2png/
+├── bot.py                    # Главный файл, инициализация бота
+├── handlers.py               # Все хендлеры (callbacks, команды, файлы)
+├── utils.py                  # Утилиты (speller, pipeline, download)
+├── converter_engine.py       # Движок конвертации (PDF, PNG, ZIP)
+├── user_manager.py           # Управление пользователями и настройками
+├── convert.py                # CLI-утилита для конвертации
+├── pdf2png.py                # Утилита PDF → PNG (для 4K)
+├── manage.sh                 # Скрипт управления процессом
+├── settings.ini              # Общие настройки
+├── config.ini.example        # Пример файла с секретами
+├── ARCHITECTURE.md           # Документация архитектуры
+├── requirements.txt          # Python-зависимости
+└── .github/                  # GitHub Actions
+    └── workflows/
+        └── deploy.yml        # CI/CD для prod/test
+
 
 8. Структура каталогов
 
@@ -192,6 +208,22 @@ Self-Hosted Runner должен быть всегда запущен на Pi.
 LibreOffice должен быть установлен для конвертации.
 RAM-диск ограничен объёмом памяти Pi (рекомендуется 4+ ГБ).
 Яндекс.Спеллер требует доступа к интернету.
+
+### Проверка зависимостей
+# Проверка LibreOffice
+soffice --version
+
+# Проверка Python-пакетов
+pip list | grep -E "aiogram|aiohttp|PyMuPDF|python-pptx"
+
+
+🐛 Известные ограничения
+
+Максимальный размер файла: 20 МБ (ограничение Telegram)
+Большие презентации (200+ слайдов) могут обрабатываться долго
+Яндекс.Спеллер требует доступа к интернету
+Self-Hosted Runner должен быть всегда запущен на Pi
+RAM-диск ограничен объёмом памяти (рекомендуется 4+ ГБ)
 
 
 
