@@ -63,3 +63,63 @@ def extract_text_from_pptx(file_path: str) -> list:
     except Exception as e:
         logging.error(f"Ошибка извлечения текста из PPTX через python-pptx: {e}")
         return []
+
+async def download_file_by_url(url: str, destination: Path, status_message: types.Message) -> bool:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    await status_message.edit_text(f"❌ Ошибка загрузки. Статус: {response.status}")
+                    return False
+                with open(destination, 'wb') as f:
+                    while True:
+                        chunk = await response.content.read(1024 * 1024)
+                        if not chunk: break
+                        f.write(chunk)
+        return True
+    except Exception as e:
+        await status_message.edit_text(f"❌ Ошибка HTTP-загрузки: {e}")
+        return False
+
+async def core_pipeline(downloaded_file_path: Path, status_message: types.Message, user_id: int):
+    work_dir = downloaded_file_path.parent
+    is_zip = downloaded_file_path.suffix.lower() == '.zip'
+    cfg = user_mgr.get_user_config(user_id)
+
+    try:
+        if is_zip:
+            await status_message.edit_text("📦 Распаковка ZIP...")
+            pptx_path = converter_engine.extract_zip_if_needed(downloaded_file_path, work_dir)
+            if not pptx_path:
+                await status_message.edit_text("❌ Внутри ZIP не найдено .pptx.")
+                return None, None
+        else:
+            pptx_path = downloaded_file_path
+
+        await status_message.edit_text(f"⏳ Конвертация через LibreOffice в RAM...\n(Качество: {cfg['quality'].upper()})")
+        
+        clean_folder = not cfg["keep_pdf"]
+        args = converter_engine.FakeArgs(
+            quality=cfg["quality"], keep_pdf=cfg["keep_pdf"], 
+            dark_mode=True, zip_mode=True, clean=clean_folder, output_dir=str(work_dir)
+        )
+        
+        # Вызов движка в фоновом пуле потоков
+        await asyncio.to_thread(converter_engine.process_file_local, pptx_path, args)
+        
+        expected_zip = next(work_dir.glob("*.zip"), None) if not is_zip else [f for f in work_dir.glob("*.zip") if f != downloaded_file_path][0]
+        
+        final_pdf_path = None
+        if cfg["keep_pdf"]:
+            png_folder = next((d for d in work_dir.iterdir() if d.is_dir() and d.name.endswith("_output")), None)
+            if png_folder:
+                pdf_file = next(png_folder.glob("*.pdf"), None)
+                if pdf_file:
+                    final_pdf_path = work_dir / f"{pptx_path.stem}.pdf"
+                    shutil.move(str(pdf_file), str(final_pdf_path))
+                shutil.rmtree(png_folder)
+
+        return expected_zip, final_pdf_path
+    except Exception as e:
+        logging.error(f"Критическая ошибка ядра: {e}")
+        return None, None
