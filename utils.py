@@ -86,7 +86,7 @@ async def download_file_by_url(url: str, destination: Path, status_message: type
         logging.error(f"Исключение при скачивании по URL: {e}")
         return False
 
-async def core_pipeline(downloaded_file_path: Path, status_message: types.Message, user_id: int):
+async def core_pipeline(downloaded_file_path: Path, status_message: types.Message, user_id: int, user_mgr):
     work_dir = downloaded_file_path.parent
     is_zip = downloaded_file_path.suffix.lower() == '.zip'
     cfg = user_mgr.get_user_config(user_id)
