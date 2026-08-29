@@ -1,7 +1,7 @@
 import aiohttp
 import logging
 import shutil
-import asyncio  # Добавлен для перехвата TimeoutError
+import asyncio  # ✅ Добавлен импорт asyncio
 from pathlib import Path
 from typing import Tuple, List, Optional
 from aiogram import Bot, types
@@ -139,17 +139,31 @@ async def download_file_by_url(url: str, destination: Path, status_message: type
         logging.error(f"Исключение при скачивании по URL: {e}")
         return False
 
+
 # ==========================================
 # 4. ОСНОВНОЙ КОНВЕЙЕР ОБРАБОТКИ
 # ==========================================
 
-async def core_pipeline(downloaded_file_path: Path, status_message: types.Message, user_id: int, user_mgr):
+async def core_pipeline(
+    downloaded_file_path: Path, 
+    status_message: types.Message, 
+    user_id: int,
+    user_mgr  # ✅ Добавлен обязательный аргумент
+) -> Tuple[Optional[Path], Optional[Path]]:
     """
     Основной конвейер конвертации презентации.
     Возвращает кортеж (путь_к_zip, путь_к_pdf) или (None, None) при ошибке.
+    
+    :param downloaded_file_path: Путь к загруженному файлу (PPTX или ZIP)
+    :param status_message: Сообщение для обновления статуса
+    :param user_id: ID пользователя для получения настроек
+    :param user_mgr: Менеджер пользователей для доступа к настройкам
+    :return: Кортеж (zip_path, pdf_path) или (None, None)
     """
     work_dir = downloaded_file_path.parent
     is_zip = downloaded_file_path.suffix.lower() == '.zip'
+    
+    # ✅ Теперь user_mgr определён и доступен
     cfg = user_mgr.get_user_config(user_id)
 
     try:
@@ -176,8 +190,8 @@ async def core_pipeline(downloaded_file_path: Path, status_message: types.Messag
             output_dir=str(work_dir)
         )
         
+        # ✅ asyncio импортирован и доступен
         # Вызов движка в фоновом пуле потоков
-        # ВАЖНО: process_file_local теперь возвращает путь к созданному ZIP
         expected_zip = await asyncio.to_thread(converter_engine.process_file_local, pptx_path, args)
         
         # Проверяем, что ZIP действительно создан
